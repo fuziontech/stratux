@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/stratux/stratux/common"
+	"github.com/stratux/stratux/gpsnmea"
 )
 
 /*
@@ -30,33 +31,13 @@ import (
 
 // Append checksum to nmea string
 func appendNmeaChecksum(nmea string) string {
-	if len(nmea) == 0 {
-		return "*00"
-	}
-	start := 0
-	if nmea[0] == '$' {
-		start = 1
-	}
-	checksum := byte(0x00)
-	for i := start; i < len(nmea); i++ {
-		checksum = checksum ^ byte(nmea[i])
-	}
-	return fmt.Sprintf("%s*%02X", nmea, checksum)
+	return gpsnmea.AppendChecksum(nmea)
 }
 
 // sanitizeNmeaTail removes NMEA delimiter/control characters from callsigns
 // before embedding them in $PFLAA/$PFLAU sentences.
 func sanitizeNmeaTail(tail string) string {
-	var b strings.Builder
-	b.Grow(len(tail))
-	for i := 0; i < len(tail); i++ {
-		c := tail[i]
-		if c < 0x20 || c >= 0x7f || c == ',' || c == '*' || c == '$' {
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
+	return gpsnmea.SanitizeTail(tail)
 }
 
 func clampInt32(v float64, minVal, maxVal int32) int32 {

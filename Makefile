@@ -22,7 +22,7 @@ else
 	OGN_RX_BINARY=ogn/ogn-rx-eu_arm
 endif
 
-STRATUX_GO_DEPS := $(wildcard main/*.go common/*.go godump978/*.go uatparse/*.go sensors/*.go sensors/*/*.go) go.mod go.sum
+STRATUX_GO_DEPS := $(wildcard main/*.go common/*.go config/*.go gdl90/*.go gpsnmea/*.go godump978/*.go uatparse/*.go sensors/*.go sensors/*/*.go) go.mod go.sum
 DUMP978_DEPS := $(wildcard dump978/*.c dump978/*.h dump978/fec/*.c dump978/fec/*.h)
 
 .PHONY: all clean install optinstall _optinstall_files www dpkg prep_dpkg optinstall_dpkg dall ddpkg xdump1090 xrtlais test

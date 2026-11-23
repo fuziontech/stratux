@@ -62,10 +62,7 @@ func main() {
 	}
 
 	// Make graph.
-	p, err := plot.New()
-	if err != nil {
-		panic(err)
-	}
+	p := plot.New()
 	p.Title.Text = "Stratux PPM vs. Time"
 	p.X.Label.Text = "1 min intervals"
 	p.Y.Label.Text = "PPM"

@@ -161,10 +161,7 @@ func main() {
 	}
 
 	// Make graph.
-	p, err := plot.New()
-	if err != nil {
-		panic(err)
-	}
+	p := plot.New()
 	p.Title.Text = "Stratux FIS-B QoS vs. Time"
 	p.X.Label.Text = "5 min intervals"
 	p.Y.Label.Text = "QoS"

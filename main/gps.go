@@ -27,6 +27,7 @@ import (
 
 	"github.com/stratux/serial"
 	"github.com/stratux/stratux/common"
+	"github.com/stratux/stratux/gpsnmea"
 )
 
 const (
@@ -174,24 +175,25 @@ func setDetectedTracker(t Tracker) {
 }
 
 func classifySatellite(sv int) (uint8, string) {
-	if sv <= 0 {
-		return SAT_TYPE_UNKNOWN, fmt.Sprintf("U%d", sv)
-	} else if sv <= 32 {
-		return SAT_TYPE_GPS, fmt.Sprintf("G%d", sv) // GPS 1-32
-	} else if sv <= 64 {
-		return SAT_TYPE_SBAS, fmt.Sprintf("S%d", sv+87) // SBAS 33-64, 33 = SBAS PRN 120
-	} else if sv <= 96 {
-		return SAT_TYPE_GLONASS, fmt.Sprintf("R%d", sv-64) // GLONASS 65-96
-	} else if sv <= 158 {
-		return SAT_TYPE_SBAS, fmt.Sprintf("S%d", sv) // SBAS 152-158
-	} else if sv <= 202 {
-		return SAT_TYPE_QZSS, fmt.Sprintf("Q%d", sv-192) // QZSS 193-202
-	} else if sv <= 336 {
-		return SAT_TYPE_GALILEO, fmt.Sprintf("E%d", sv-300) // GALILEO 301-336
-	} else if sv <= 463 {
-		return SAT_TYPE_BEIDOU, fmt.Sprintf("B%d", sv-400) // BEIDOU 401-463
+	c, _ := gpsnmea.ClassifySatellite(sv)
+	var satType uint8
+	switch c {
+	case gpsnmea.ConstellationGPS:
+		satType = SAT_TYPE_GPS
+	case gpsnmea.ConstellationSBAS:
+		satType = SAT_TYPE_SBAS
+	case gpsnmea.ConstellationGLONASS:
+		satType = SAT_TYPE_GLONASS
+	case gpsnmea.ConstellationQZSS:
+		satType = SAT_TYPE_QZSS
+	case gpsnmea.ConstellationGalileo:
+		satType = SAT_TYPE_GALILEO
+	case gpsnmea.ConstellationBeidou:
+		satType = SAT_TYPE_BEIDOU
+	default:
+		satType = SAT_TYPE_UNKNOWN
 	}
-	return SAT_TYPE_UNKNOWN, fmt.Sprintf("U%d", sv)
+	return satType, gpsnmea.FormatSatelliteID(sv)
 }
 
 /*
@@ -624,35 +626,7 @@ func writeTrackerConfigFromSettings() {
 // Checksum is calculated as XOR of all bytes between "$" and "*"
 
 func validateNMEAChecksum(s string) (string, bool) {
-	//validate format. NMEA sentences start with "$" and end in "*xx" where xx is the XOR value of all bytes between
-	if !(strings.HasPrefix(s, "$") && strings.Contains(s, "*")) {
-		return "", false
-	}
-
-	// strip leading "$" and split at "*"
-	s_split := strings.Split(strings.TrimPrefix(s, "$"), "*")
-	s_out := s_split[0]
-	s_cs := s_split[1]
-
-	if len(s_cs) < 2 {
-		return "Missing checksum. Fewer than two bytes after asterisk", false
-	}
-
-	cs, err := strconv.ParseUint(s_cs[:2], 16, 8)
-	if err != nil {
-		return "Invalid checksum", false
-	}
-
-	cs_calc := byte(0)
-	for i := range s_out {
-		cs_calc = cs_calc ^ byte(s_out[i])
-	}
-
-	if cs_calc != byte(cs) {
-		return fmt.Sprintf("Checksum failed. Calculated %#X; expected %#X", cs_calc, cs), false
-	}
-
-	return s_out, true
+	return gpsnmea.ValidateChecksum(s)
 }
 
 // Only count this heading if a "sustained" >7 kts is obtained. This filters out a lot of heading

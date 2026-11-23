@@ -11,16 +11,16 @@ package main
 
 import (
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"text/template"
 	"time"
+
+	"github.com/stratux/stratux/config"
 )
 
 const (
@@ -56,9 +56,6 @@ type wifiClientNetwork struct {
 }
 
 var (
-	wifiDirectPinRegex = regexp.MustCompile(`^[0-9]{8}$`)
-	wifiCountryRegex   = regexp.MustCompile(`^[A-Z]{2}$`)
-
 	hasChanged        bool
 	hasChangedMutex   sync.Mutex
 	applyNetworkMutex sync.Mutex
@@ -68,45 +65,23 @@ var (
 // directives or break quoting in wpa_supplicant*.conf templates (newlines, NUL,
 // ASCII control characters, double quotes, or backslashes).
 func isSafeWpaString(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == 0x7f || c == '"' || c == '\\' {
-			return false
-		}
-	}
-	return true
+	return config.IsSafeWpaString(s)
 }
 
 // sanitizeWpaString strips any unsafe characters as defense-in-depth when
 // rendering templates from values loaded out of stratux.conf.
 func sanitizeWpaString(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == 0x7f || c == '"' || c == '\\' {
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
+	return config.SanitizeWpaString(s)
 }
 
 func validateIPv4(ip string) (string, bool) {
-	parsed := net.ParseIP(strings.TrimSpace(ip))
-	if parsed == nil {
-		return "", false
-	}
-	v4 := parsed.To4()
-	if v4 == nil {
-		return "", false
-	}
-	return v4.String(), true
+	return config.ValidateIPv4(ip)
 }
 
 func setWifiCountry(countryCode string) {
-	countryCode = strings.ToUpper(strings.TrimSpace(countryCode))
-	if !wifiCountryRegex.MatchString(countryCode) {
+	if cleanCountry, ok := config.ValidateCountry(countryCode); ok {
+		countryCode = cleanCountry
+	} else {
 		log.Printf("Ignoring invalid WiFiCountry %q; using fallback %s", countryCode, defaultWiFiCountry)
 		countryCode = defaultWiFiCountry
 	}
@@ -236,7 +211,7 @@ func setWiFiMode(mode int) {
 }
 
 func setWifiDirectPin(pin string) {
-	if !wifiDirectPinRegex.MatchString(pin) {
+	if !config.ValidateDirectPin(pin) {
 		log.Printf("Ignoring invalid WiFiDirectPin (must be exactly 8 digits)")
 		return
 	}
@@ -351,11 +326,12 @@ func applyNetworkSettings(force bool, onlyWriteFiles bool) {
 	}
 
 	// Re-validate / sanitize all fields before template rendering (defense in depth against tampered stratux.conf).
-	wifiCountry = strings.ToUpper(strings.TrimSpace(wifiCountry))
-	if !wifiCountryRegex.MatchString(wifiCountry) {
+	if cleanCountry, ok := config.ValidateCountry(wifiCountry); ok {
+		wifiCountry = cleanCountry
+	} else {
 		wifiCountry = defaultWiFiCountry
 	}
-	if !wifiDirectPinRegex.MatchString(wifiDirectPin) {
+	if !config.ValidateDirectPin(wifiDirectPin) {
 		if wifiDirectPin != "" {
 			log.Printf("Invalid WiFiDirectPin in settings, falling back to default")
 		}

@@ -1,3 +1,4 @@
+/*! ol-layerswitcher v4.1.2 (MIT) https://github.com/walkermatt/ol-layerswitcher */
 .layer-switcher {
   position: absolute;
   top: 3.5em;
@@ -35,9 +36,14 @@
 .layer-switcher button:hover {
   background-color: white;
 }
+
 .layer-switcher.shown {
   overflow-y: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100% - 5.5em);
 }
+
 .layer-switcher.shown.ol-control {
   background-color: transparent;
 }
@@ -59,7 +65,7 @@
   right: 2px;
   position: absolute;
   background-color: #eee;
-  margin: 0 1px;
+  margin: 1px;
 }
 
 .layer-switcher.shown button:focus,

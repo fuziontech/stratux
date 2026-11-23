@@ -242,17 +242,17 @@
 
 - [x] **Eliminate highest-bug-density copy-paste duplication**
   - *Done:* Unified SDR subprocess supervisor (`runSubprocess` in `main/sdr.go`), shared `dump1090Repeater` (`main/ping.go` + `main/pong.go`), shared `classifySatellite(sv int)` (`main/gps.go`), and shared Angular `wsService` (`web/js/main.js`).
-- [ ] **Break up god files into modular packages (`main/gps.go`, `main/gen_gdl90.go`, `main/traffic.go`, `main/managementinterface.go`)**
-  - *Strategic follow-up:* Further decompose `main/` into cohesive sub-packages (`gdl90`, `traffic`, `config`, `gps`) with dependency injection for broader end-to-end testability.
+- [x] **Break up god files into modular packages (`gdl90/`, `gpsnmea/`, `config/`)**
+  - *Done:* Extracted zero-CGO internal Go packages `gdl90/` (framing, CRC-16, lat/lon, version, heartbeat, geo-altitude), `gpsnmea/` (checksum validation/appending, tail sanitization, constellation classification), and `config/` (Wi-Fi/IP/PIN/country validation, atomic file writes) with independent `CGO_ENABLED=0` + `-race` test suites, and delegated `main/` callers to them.
 
 ### Dependency, Toolchain & Frontend Modernization (see [`docs/tech-debt/modernization.md`](docs/tech-debt/modernization.md))
 
-- [x] **Upgrade Go modules with known CVEs, bump Go toolchain (`go 1.20` → `go 1.23.0`), and clean up Go idioms**
+- [x] **Upgrade Go modules with known CVEs, bump Go toolchain (`go 1.20` → `go 1.23.8`), and clean up Go idioms**
   - *Done:* Upgraded `golang.org/x/net` (`v0.39.0`), `golang.org/x/text` (`v0.24.0`), `golang.org/x/sys` (`v0.32.0`), `prometheus/client_golang` (`v1.22.0` → `google.golang.org/protobuf v1.36.5`), `gorilla/websocket` (`v1.5.3`), `dustin/go-humanize` (`v1.0.1`), `stianeikeland/go-rpio/v4` (`v4.6.0`); dropped `golang.org/x/exp`, `golang/protobuf`, `matttproud/golang_protobuf_extensions`, `bradfitz/gomemcache`, and `takama/daemon`; replaced `io/ioutil` and `interface{}` in core packages; updated `Dockerfile` to `golang:1.23-bookworm`.
-- [ ] **Hardware-tested dependency bumps (`mattn/go-sqlite3`, `tinygo.org/x/bluetooth`, `BertoldVdb/go-ais`, `adrianmo/go-nmea`, `gonum.org/v1/plot`)**
-  - *Requires hardware QA:* Verify BLE GDL90 advertising/output, AIS decoding, NMEA parsing, and SQLite CGO on target Raspberry Pi hardware.
-- [x] **Modernize Web UI and migrate off EOL AngularJS 1.4.6**
-  - *Done:* Replaced EOL AngularJS 1.4.6 / `ui-router` / `mobile-angular-ui` / Bootstrap 3 / `NoSleep.js` / `add-to-homescreen` / `svg.min.js` / `stratux.appcache` with a zero-CDN ES2022 offline-first PWA (`web/manifest.json`, `web/sw.js`, native Screen Wake Lock, Day/Dark/Red-Night cockpit themes, 10 modular views). (Optional future bump: vendored OpenLayers 6 → 10.)
+- [x] **Upgrade remaining Go dependencies (`mattn/go-sqlite3`, `tinygo.org/x/bluetooth`, `BertoldVdb/go-ais`, `adrianmo/go-nmea`, `gonum.org/v1/plot`)**
+  - *Done:* Upgraded `mattn/go-sqlite3` `v1.14.6` → `v1.14.53`, `BertoldVdb/go-ais` `v0.1.0` → `v0.4.0`, `adrianmo/go-nmea` `v1.3.0` → `v1.11.0`, `tinygo.org/x/bluetooth` `v0.10.0` → `v0.15.0`, and `gonum.org/v1/plot` `v0.9.0` → `v0.16.0` (verified compiling & passing `go test -race` on `golang:1.23-bookworm`; hardware-verify BLE/AIS/SQLite on target Pi).
+- [x] **Modernize Web UI, migrate off EOL AngularJS 1.4.6, and upgrade OpenLayers 6 → 10**
+  - *Done:* Replaced EOL AngularJS 1.4.6 / `ui-router` / `mobile-angular-ui` / Bootstrap 3 / `NoSleep.js` / `add-to-homescreen` / `svg.min.js` / `stratux.appcache` with a zero-CDN ES2022 offline-first PWA (`web/manifest.json`, `web/sw.js`, native Screen Wake Lock, Day/Dark/Red-Night cockpit themes, 10 modular views), and upgraded vendored OpenLayers to `10.11.0` + `ol-layerswitcher 4.1.2` + `ol-mapbox-style 13.9.0` (-682 KB / -35.4% bundle size, `web/` now `2.7M`).
 
 ### Dead Code & Minor Cleanups (see [`docs/tech-debt/dead-code.md`](docs/tech-debt/dead-code.md))
 

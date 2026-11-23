@@ -38,6 +38,8 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/ricochet2200/go-disk-usage/du"
 	"github.com/stratux/stratux/common"
+	"github.com/stratux/stratux/config"
+	"github.com/stratux/stratux/gdl90"
 	"github.com/stratux/stratux/uatparse"
 )
 
@@ -190,9 +192,6 @@ var product_name_map = map[int]string{
 	413: "Text",    //"Generic Textual Data Product APDU Payload Format Type 2";
 }
 
-// CRC16 table generated to use to work with GDL90 messages.
-var Crc16Table [256]uint16
-
 // Current AHRS, pressure altitude, etc.
 var mySituation SituationData
 
@@ -246,125 +245,28 @@ var ADSBTowerMutex *sync.Mutex
 var parsedStratuxVersion [4]byte
 
 func parseStratuxVersion(ver string) [4]byte {
-	var out [4]byte
-	v := strings.TrimPrefix(ver, "v")
-	dotIdx := strings.Index(v, ".")
-	if dotIdx < 0 {
-		return out
-	}
-	mStr := v[:dotIdx]
-	mibStr := v[dotIdx+1:]
-
-	tp := 0
-	miStr := mibStr
-	bStr := ""
-	if idx := strings.Index(mibStr, "rc"); idx != -1 {
-		tp = 3
-		miStr = mibStr[:idx]
-		bStr = mibStr[idx+2:]
-	} else if idx := strings.Index(mibStr, "r"); idx != -1 {
-		tp = 2
-		miStr = mibStr[:idx]
-		bStr = mibStr[idx+1:]
-	} else if idx := strings.Index(mibStr, "b"); idx != -1 {
-		tp = 1
-		miStr = mibStr[:idx]
-		bStr = mibStr[idx+1:]
-	}
-	if dash := strings.Index(miStr, "-"); dash != -1 {
-		miStr = miStr[:dash]
-	}
-	if dash := strings.Index(bStr, "-"); dash != -1 {
-		bStr = bStr[:dash]
-	}
-
-	m, _ := strconv.Atoi(mStr)
-	mi, _ := strconv.Atoi(miStr)
-	b, _ := strconv.Atoi(bStr)
-	out[0] = byte(m)
-	out[1] = byte(mi)
-	out[2] = byte(tp)
-	out[3] = byte(b)
-	return out
+	return gdl90.ParseStratuxVersion(ver)
 }
 
 func normalizeAngle360(deg float64) float64 {
-	if math.IsNaN(deg) || math.IsInf(deg, 0) {
-		return 0
-	}
-	deg = math.Mod(deg, 360.0)
-	if deg < 0 {
-		deg += 360.0
-	}
-	return deg
+	return gdl90.NormalizeAngle360(deg)
 }
 
-// Construct the CRC table. Adapted from FAA ref above.
-func crcInit() {
-	var i uint16
-	var bitctr uint16
-	var crc uint16
-	for i = 0; i < 256; i++ {
-		crc = (i << 8)
-		for bitctr = 0; bitctr < 8; bitctr++ {
-			z := uint16(0)
-			if (crc & 0x8000) != 0 {
-				z = 0x1021
-			}
-			crc = (crc << 1) ^ z
-		}
-		Crc16Table[i] = crc
-	}
-}
+// crcInit is a no-op; the CRC16 table is initialized by package gdl90's init().
+func crcInit() {}
 
 // Compute CRC. Adapted from FAA ref above.
 func crcCompute(data []byte) uint16 {
-	ret := uint16(0)
-	for i := 0; i < len(data); i++ {
-		ret = Crc16Table[ret>>8] ^ (ret << 8) ^ uint16(data[i])
-	}
-	return ret
+	return gdl90.ComputeCRC(data)
 }
 
 func prepareMessage(data []byte) []byte {
-	// Compute CRC before modifying the message, without mutating caller's slice.
-	crc := crcCompute(data)
-
-	tmp := make([]byte, 0, len(data)+6)
-	tmp = append(tmp, 0x7E) // Flag start.
-
-	appendEscaped := func(mv byte) {
-		if mv == 0x7E || mv == 0x7D {
-			tmp = append(tmp, 0x7D, mv^0x20)
-		} else {
-			tmp = append(tmp, mv)
-		}
-	}
-
-	// Copy the message over, escaping 0x7E (Flag Byte) and 0x7D (Control-Escape).
-	for _, mv := range data {
-		appendEscaped(mv)
-	}
-	// Append the two CRC16 bytes, escaping control characters.
-	appendEscaped(byte(crc & 0xFF))
-	appendEscaped(byte(crc >> 8))
-
-	tmp = append(tmp, 0x7E) // Flag end.
-
-	return tmp
+	return gdl90.PrepareMessage(data)
 }
 
 func makeLatLng(v float32) []byte {
-	ret := make([]byte, 3)
-
-	v = v / LON_LAT_RESOLUTION
-	wk := int32(v)
-
-	ret[0] = byte((wk & 0xFF0000) >> 16)
-	ret[1] = byte((wk & 0x00FF00) >> 8)
-	ret[2] = byte((wk & 0x0000FF))
-
-	return ret
+	b := gdl90.EncodeLatLon(v)
+	return b[:]
 }
 
 func isDetectedOwnshipValid() bool {
@@ -1801,44 +1703,10 @@ func saveSettings() {
 		return
 	}
 
-	dir := filepath.Dir(configLocation)
-	tmpFile, err := os.CreateTemp(dir, ".stratux.conf.tmp.*")
-	if err != nil {
+	if err = config.AtomicWriteFile(configLocation, jsonSettings, 0644); err != nil {
 		addSingleSystemErrorf("save-settings", "can't save settings %s: %s", configLocation, err.Error())
 		return
 	}
-	tmpName := tmpFile.Name()
-	cleanupTmp := true
-	defer func() {
-		if cleanupTmp {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err = tmpFile.Write(jsonSettings); err != nil {
-		_ = tmpFile.Close()
-		addSingleSystemErrorf("save-settings", "can't write settings %s: %s", configLocation, err.Error())
-		return
-	}
-	if err = tmpFile.Chmod(0644); err != nil {
-		_ = tmpFile.Close()
-		addSingleSystemErrorf("save-settings", "can't chmod settings %s: %s", configLocation, err.Error())
-		return
-	}
-	if err = tmpFile.Sync(); err != nil {
-		_ = tmpFile.Close()
-		addSingleSystemErrorf("save-settings", "can't sync settings %s: %s", configLocation, err.Error())
-		return
-	}
-	if err = tmpFile.Close(); err != nil {
-		addSingleSystemErrorf("save-settings", "can't close settings %s: %s", configLocation, err.Error())
-		return
-	}
-	if err = os.Rename(tmpName, configLocation); err != nil {
-		addSingleSystemErrorf("save-settings", "can't rename settings %s: %s", configLocation, err.Error())
-		return
-	}
-	cleanupTmp = false
 	removeSingleSystemError("save-settings")
 	log.Printf("wrote settings.\n")
 }

@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -46,8 +46,8 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}
           CGO_CFLAGS_ALLOW: -L${{ github.workspace }}
         run: |
-          go vet ./main/... ./common/... ./sensors/... ./uatparse/... ./fancontrol_main/... ./godump978/...
-          go test -race ./main/... ./common/... ./sensors/... ./uatparse/... ./fancontrol_main/... ./godump978/...
+          go vet ./main/... ./common/... ./sensors/... ./uatparse/... ./fancontrol_main/... ./godump978/... ./gdl90/... ./gpsnmea/... ./config/...
+          go test -race ./main/... ./common/... ./sensors/... ./uatparse/... ./fancontrol_main/... ./godump978/... ./gdl90/... ./gpsnmea/... ./config/...
           go run test/replay_harness.go -file test-data/example.dump978
 
       - name: Shell script syntax and shellcheck
