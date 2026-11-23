@@ -1,6 +1,5 @@
-ifeq ($(statuxBuild),)
-stratuxBuild=`git log -n 1 --pretty=%H`
-buildtime=`date +%s`
+ifeq ($(stratuxBuild),)
+stratuxBuild := $(shell git log -n 1 --pretty=%h 2>/dev/null || date +%s)
 endif
 
 ifeq ($(STRATUX_HOME),)
@@ -9,16 +8,15 @@ endif
 
 www=$(STRATUX_HOME)/www
 
+.PHONY: all
+
 all:
 	mkdir -p $(www)
+	rm -rf $(www)/css $(www)/js $(www)/img $(www)/maui $(www)/plates
 	cp -r css $(www)/
 	cp -r js $(www)/
 	cp -r img $(www)/
-	cp -r maui $(www)/
-	cp -r plates $(www)/
 	cp index.html $(www)/
+	cp manifest.json $(www)/
 	cp alert.wav $(www)/
-	cp stratux.appcache $(www)/
-	# Mark the manifest with the git hash.
-	echo "# build time: " ${buildtime} >>$(www)/stratux.appcache
-	echo "# Stratux build: " ${stratuxBuild} >>$(www)/stratux.appcache
+	sed 's/__STRATUX_BUILD__/$(stratuxBuild)/g' sw.js > $(www)/sw.js

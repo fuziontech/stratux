@@ -1,0 +1,13 @@
+[Unit]
+Description=Stratux USB-C Tethered EFB Network Gadget (USB-NCM)
+After=local-fs.target
+Before=stratux.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/stratux/bin/stratux-usb-gadget.sh start
+ExecStop=/opt/stratux/bin/stratux-usb-gadget.sh stop
+
+[Install]
+WantedBy=multi-user.target

@@ -6,6 +6,7 @@ and converted to use embed
 */
 import (
 	"errors"
+	"time"
 
 	"github.com/kidoman/embd"
 )
@@ -14,7 +15,7 @@ var (
 	errConfigWrite  = errors.New("bmp388: failed to configure sensor, check connection")
 	errConfig       = errors.New("bmp388: there is a problem with the configuration, try reducing ODR")
 	errCaliRead     = errors.New("bmp388: failed to read calibration coefficient register")
-	errSoftReset    = errors.New("bmp388: failed to perform a soft reset")
+	errDataNotReady = errors.New("bmp388: timed out waiting for forced mode conversion")
 	ErrNotConnected = errors.New("bmp388: not connected")
 )
 
@@ -66,14 +67,18 @@ func (d *BMP388) Configure(config Config) (err error) {
 	}
 
 	// Turning on the pressure and temperature sensors and setting the measurement mode
-	err = d.writeRegister(RegPwrCtrl, PwrPress|PwrTemp|byte(d.Config.Mode))
+	if err = d.writeRegister(RegPwrCtrl, PwrPress|PwrTemp|byte(d.Config.Mode)); err != nil {
+		return errConfigWrite
+	}
 
 	// Configure the oversampling, output data rate, and iir filter coefficient settings
-	err = d.writeRegister(RegOSR, byte(d.Config.Pressure|d.Config.Temperature<<3))
-	err = d.writeRegister(RegODR, byte(d.Config.ODR))
-	err = d.writeRegister(RegIIR, byte(d.Config.IIR<<1))
-
-	if err != nil {
+	if err = d.writeRegister(RegOSR, byte(d.Config.Pressure|d.Config.Temperature<<3)); err != nil {
+		return errConfigWrite
+	}
+	if err = d.writeRegister(RegODR, byte(d.Config.ODR)); err != nil {
+		return errConfigWrite
+	}
+	if err = d.writeRegister(RegIIR, byte(d.Config.IIR<<1)); err != nil {
 		return errConfigWrite
 	}
 
@@ -107,6 +112,7 @@ func (d *BMP388) Configure(config Config) (err error) {
 
 	return nil
 }
+
 func (d *BMP388) tlinCompensate() (int64, error) {
 	rawTemp, err := d.readSensorData(RegTemp)
 	if err != nil {
@@ -120,10 +126,9 @@ func (d *BMP388) tlinCompensate() (int64, error) {
 	partialData4 := partialData3 * int64(d.cali.t3)
 	partialData5 := (partialData2 * 262144) + partialData4
 	return partialData5 / 4294967296, nil
-
 }
-func (d *BMP388) ReadTemperature() (float64, error) {
 
+func (d *BMP388) ReadTemperature() (float64, error) {
 	tlin, err := d.tlinCompensate()
 	if err != nil {
 		return 0, err
@@ -132,8 +137,8 @@ func (d *BMP388) ReadTemperature() (float64, error) {
 	temp := (tlin * 25) / 16384
 	return float64(temp) / 100, nil
 }
-func (d *BMP388) ReadPressure() (float64, error) {
 
+func (d *BMP388) ReadPressure() (float64, error) {
 	tlin, err := d.tlinCompensate()
 	if err != nil {
 		return 0, err
@@ -171,16 +176,18 @@ func (d *BMP388) ReadPressure() (float64, error) {
 	compPress := ((uint64(partialData4) * 25) / uint64(1099511627776))
 	return float64(compPress) / 10000, nil
 }
+
 func (d *BMP388) Connected() bool {
 	data, err := d.readRegister(RegChipId, 1)
 	return err == nil && (data[0] == ChipId || data[0] == ChipId390) // returns true if i2c comm was good and response equals 0x50/0x60
 }
+
 func (d *BMP388) SetMode(mode Mode) error {
 	d.Config.Mode = mode
 	return d.writeRegister(RegPwrCtrl, PwrPress|PwrTemp|byte(d.Config.Mode))
 }
-func (d *BMP388) readSensorData(register byte) (data int64, err error) {
 
+func (d *BMP388) readSensorData(register byte) (data int64, err error) {
 	if !d.Connected() {
 		return 0, ErrNotConnected
 	}
@@ -190,17 +197,37 @@ func (d *BMP388) readSensorData(register byte) (data int64, err error) {
 	if d.Config.Mode != Normal {
 		err = d.SetMode(Forced)
 		if err != nil {
-			return
+			return 0, err
+		}
+		drdyBit := DRDYPress
+		if register == RegTemp {
+			drdyBit = DRDYTemp
+		}
+		ready := false
+		for i := 0; i < 50; i++ {
+			stat, statErr := d.readRegister(RegStat, 1)
+			if statErr != nil {
+				return 0, statErr
+			}
+			if stat[0]&drdyBit != 0 {
+				ready = true
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if !ready {
+			return 0, errDataNotReady
 		}
 	}
 
 	bytes, err := d.readRegister(register, 3)
 	if err != nil {
-		return
+		return 0, err
 	}
 	data = int64(bytes[2])<<16 | int64(bytes[1])<<8 | int64(bytes[0])
-	return
+	return data, nil
 }
+
 func (d *BMP388) configurationError() bool {
 	data, err := d.readRegister(RegErr, 1)
 	return err == nil && (data[0]&0x04) != 0

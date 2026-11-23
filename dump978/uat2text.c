@@ -25,10 +25,21 @@ void handle_frame(frame_type_t type, uint8_t *frame, int len, void *extra)
 {
     if (type == UAT_DOWNLINK) {
         struct uat_adsb_mdb mdb;
+        if (len == SHORT_FRAME_DATA_BYTES) {
+            if ((frame[0] >> 3) != 0)
+                return;
+        } else if (len == LONG_FRAME_DATA_BYTES) {
+            if ((frame[0] >> 3) == 0)
+                return;
+        } else {
+            return;
+        }
         uat_decode_adsb_mdb(frame, &mdb);
         uat_display_adsb_mdb(&mdb, stdout);
     } else {
         struct uat_uplink_mdb mdb;
+        if (len != UPLINK_FRAME_DATA_BYTES)
+            return;
         uat_decode_uplink_mdb(frame, &mdb);
         uat_display_uplink_mdb(&mdb, stdout);
     }

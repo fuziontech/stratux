@@ -8,6 +8,18 @@ on:
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Optional release tag (e.g. v3.6) to attach artifacts to a draft GitHub Release"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build_image:
@@ -26,15 +38,48 @@ jobs:
           cd image_build
           ./build.sh
 
-      - name: Pi Image
+      - name: Sign Debian packages with minisign (optional)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_SECRET_KEY_PASSWORD: ${{ secrets.MINISIGN_SECRET_KEY_PASSWORD }}
+        run: |
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "MINISIGN_SECRET_KEY is not configured; skipping OTA package signing."
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          keyfile="$(mktemp)"
+          trap 'rm -f "${keyfile}"' EXIT
+          chmod 600 "${keyfile}"
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${keyfile}"
+          shopt -s nullglob
+          for deb in image_build/pi-gen/stratux/stratux-*.deb; do
+            if [ -n "${MINISIGN_SECRET_KEY_PASSWORD}" ]; then
+              printf '%s\n' "${MINISIGN_SECRET_KEY_PASSWORD}" | minisign -S -s "${keyfile}" -m "${deb}" -x "${deb}.minisig"
+            else
+              minisign -S -s "${keyfile}" -m "${deb}" -x "${deb}.minisig" </dev/null
+            fi
+            echo "Signed ${deb} -> ${deb}.minisig"
+          done
+
+      - name: Create Draft Release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag_name != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: image_build/pi-gen/deploy/*
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          files: |
+            image_build/pi-gen/deploy/*
+            image_build/pi-gen/stratux/*.deb
+            image_build/pi-gen/stratux/*.minisig
           draft: true
 
-      - name: Debian Package
-        uses: softprops/action-gh-release@v2
+      - name: Upload Build Artifacts (untagged workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.tag_name == ''
+        uses: actions/upload-artifact@v7
         with:
-          files: |
+          name: stratux-release-artifacts
+          path: |
+            image_build/pi-gen/deploy/*
             image_build/pi-gen/stratux/*.deb
-          draft: true
+            image_build/pi-gen/stratux/*.minisig
+          if-no-files-found: error

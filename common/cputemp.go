@@ -1,7 +1,8 @@
 package common
 
 import (
-	"io/ioutil"
+	"context"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -9,35 +10,61 @@ import (
 
 const InvalidCpuTemp = float32(-99.0)
 
+const cpuTempSysfsPath = "/sys/class/thermal/thermal_zone0/temp"
+
 type CpuTempUpdateFunc func(cpuTemp float32)
 
-/* cpuTempMonitor() reads the RPi board temperature every second and
+func parseCPUTemp(raw []byte) float32 {
+	tempStr := strings.TrimSpace(string(raw))
+	if tempStr == "" {
+		return InvalidCpuTemp
+	}
+	tInt, err := strconv.Atoi(tempStr)
+	if err != nil {
+		return InvalidCpuTemp
+	}
+	if tInt > 1000 {
+		return float32(tInt) / float32(1000.0)
+	}
+	return float32(tInt) // case where Temp is returned as simple integer
+}
+
+func readCPUTemp(path string) float32 {
+	temp, err := os.ReadFile(path)
+	if err != nil {
+		return InvalidCpuTemp
+	}
+	return parseCPUTemp(temp)
+}
+
+func cpuTempMonitor(ctx context.Context, path string, interval time.Duration, updater CpuTempUpdateFunc) {
+	if updater == nil {
+		return
+	}
+	timer := time.NewTicker(interval)
+	defer timer.Stop()
+
+	for {
+		// Update CPUTemp.
+		t := readCPUTemp(path)
+		if IsCPUTempValid(t) { // Only update if valid value was obtained.
+			updater(t)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+/* CpuTempMonitor reads the RPi board temperature every second and
 calls a callback.  This is broken out into its own function (run as
 its own goroutine) because the RPi temperature monitor code is buggy,
 and often times reading this file hangs quite some time.  */
 
 func CpuTempMonitor(updater CpuTempUpdateFunc) {
-	timer := time.NewTicker(1 * time.Second)
-	for {
-		// Update CPUTemp.
-		temp, err := ioutil.ReadFile("/sys/class/thermal/thermal_zone0/temp")
-		tempStr := strings.Trim(string(temp), "\n")
-		t := InvalidCpuTemp
-		if err == nil {
-			tInt, err := strconv.Atoi(tempStr)
-			if err == nil {
-				if tInt > 1000 {
-					t = float32(tInt) / float32(1000.0)
-				} else {
-					t = float32(tInt) // case where Temp is returned as simple integer
-				}
-			}
-		}
-		if t >= InvalidCpuTemp { // Only update if valid value was obtained.
-			updater(t)
-		}
-		<-timer.C
-	}
+	cpuTempMonitor(context.Background(), cpuTempSysfsPath, 1*time.Second, updater)
 }
 
 // Check if CPU temperature is valid. Assume <= 0 is invalid.

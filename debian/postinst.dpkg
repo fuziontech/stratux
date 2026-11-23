@@ -1,22 +1,45 @@
 #!/bin/bash
-echo "Post install script for stratux is running.."
-systemctl daemon-reload
+set -e
 
-echo "Enabling stratux"
-systemctl enable stratux
+case "${1:-}" in
+	configure)
+		echo "Post install script for stratux is running.."
+		arch="$(uname -m)"
+		is_rpi=false
+		if [ "${arch}" = "aarch64" ] && [ -f "/boot/firmware/config.txt" ]; then
+			is_rpi=true
+		fi
 
-echo "Enabling udev"
-systemctl restart udev
+		echo "Enabling stratux services"
+		systemctl enable stratux-update.service 2>/dev/null || true
+		systemctl enable stratux-ota-watchdog.service 2>/dev/null || true
+		systemctl enable stratux-usb-gadget.service 2>/dev/null || true
+		systemctl enable stratux.service 2>/dev/null || true
+		if [ "${is_rpi}" = "true" ]; then
+			systemctl enable stratux_fancontrol.service 2>/dev/null || true
+		fi
 
-echo "Starting stratux"
-systemctl start stratux
+		if [ -d /run/systemd/system ]; then
+			systemctl daemon-reload || true
 
-# Raspberry Pi's have the config.txt so this is one way to determine if its a raspberry pi
-arch=$(uname -m)
-if  [ "$arch" == "aarch64" ]; then
-    if [ -f "/boot/firmware/config.txt" ]; then
-            systemctl enable stratux_fancontrol
-            systemctl start stratux_fancontrol
-    fi
-fi
+			echo "Reloading udev rules"
+			systemctl restart udev 2>/dev/null || udevadm control --reload-rules 2>/dev/null || true
+
+			echo "Starting stratux USB gadget and main service"
+			systemctl start stratux-usb-gadget.service 2>/dev/null || true
+			systemctl start stratux.service || true
+
+			if [ "${is_rpi}" = "true" ]; then
+				systemctl start stratux_fancontrol.service || true
+			fi
+
+			if systemctl is-active --quiet avahi-daemon.service 2>/dev/null; then
+				systemctl reload avahi-daemon.service 2>/dev/null || true
+			fi
+		fi
+		;;
+	abort-upgrade|abort-remove|abort-deconfigure)
+		;;
+esac
+
 exit 0

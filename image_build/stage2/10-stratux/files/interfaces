@@ -19,9 +19,10 @@ iface ap0 inet static
 
 # Pure AP mode
 iface wlan0 inet manual
+  pre-up ifdown ap0; ip link set ap0 down; iw ap0 del || true
   pre-up iw wlan0 set type managed; iw phy0 interface add ap0 type __ap; ifup ap0
   wireless-power off
-  post-down ifdown ap0; ifconfig ap0 down; iw ap0 del
+  post-down ifdown ap0; ip link set ap0 down; iw ap0 del || true
 
 
 

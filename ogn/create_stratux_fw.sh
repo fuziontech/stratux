@@ -1,19 +1,22 @@
 #!/bin/bash
 # Requires having platformio installed in your $PATH!
 
-set -e
+set -euo pipefail
 
-if ! command -v platformio; then
-    echo "Please install platformio to your PATH first"
+if ! command -v platformio >/dev/null 2>&1; then
+    echo "Please install platformio to your PATH first" >&2
     exit 1
 fi
 
 cd "$(dirname "$0")"
 STRATUX_OGN_DIR="$(pwd)"
 
-
 cd ogn-tracker
 
+cleanup() {
+    git -C "${STRATUX_OGN_DIR}/ogn-tracker" checkout -- platformio.ini 2>/dev/null || true
+}
+trap cleanup EXIT
 
 function append_defaultconfig {
     echo \
@@ -41,30 +44,31 @@ function append_defaultconfig {
 }
 
 function package {
-    fname=$1
-    cd .pio/build/$fname
-    zip $fname.zip bootloader.bin firmware.bin partitions.bin
-    mv $fname.zip $STRATUX_OGN_DIR/
-    cd -
+    local fname="$1"
+    (
+        cd ".pio/build/${fname}"
+        zip "${fname}.zip" bootloader.bin firmware.bin partitions.bin
+        mv "${fname}.zip" "${STRATUX_OGN_DIR}/"
+    )
 }
 
 
 function create_fw {
-    name=$1
-    board=$2
-    flags=$3
+    local name="$1"
+    local board="$2"
+    local flags="$3"
 
-    git checkout platformio.ini
+    git checkout -- platformio.ini
     echo "
-[env:$name]
-board = $board
+[env:${name}]
+board = ${board}
 build_flags = " >> platformio.ini
     append_defaultconfig
-    echo "$flags" >> platformio.ini
-    platformio run -e $name
-    package $name
+    echo "${flags}" >> platformio.ini
+    platformio run -e "${name}"
+    package "${name}"
 
-    git checkout platformio.ini
+    git checkout -- platformio.ini
 }
 
 
@@ -129,4 +133,3 @@ create_fw ogn-tracker-bin-tbeams3-sx1262-ubx esp32-s3-devkitc-1 '
     -DARDUINO_USB_MODE=1        
     -DARDUINO_USB_CDC_ON_BOOT=1
 board_build.mcu = esp32s3'
-

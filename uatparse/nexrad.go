@@ -1,13 +1,13 @@
 package uatparse
 
-import ()
-
 const (
 	BLOCK_WIDTH      = float64(48.0 / 60.0)
 	WIDE_BLOCK_WIDTH = float64(96.0 / 60.0)
 	BLOCK_HEIGHT     = float64(4.0 / 60.0)
 	BLOCK_THRESHOLD  = 405000
 	BLOCKS_PER_RING  = 450
+	MAX_BLOCK_NUM    = 607500
+	MAX_NEXRAD_BINS  = 128
 )
 
 type NEXRADBlock struct {
@@ -70,6 +70,10 @@ func (f *UATFrame) decodeNexradFrame() {
 	block_num := ((int(f.FISB_data[0]) & 0x0f) << 16) | (int(f.FISB_data[1]) << 8) | (int(f.FISB_data[2]))
 	scale_factor := (int(f.FISB_data[0]) & 0x30) >> 4
 
+	if block_num > MAX_BLOCK_NUM {
+		return
+	}
+
 	if rle_flag { // Single bin, RLE encoded.
 		lat, lon, h, w := block_location(block_num, ns_flag, scale_factor)
 		var tmp NEXRADBlock
@@ -79,34 +83,34 @@ func (f *UATFrame) decodeNexradFrame() {
 		tmp.LonWest = lon
 		tmp.Height = h
 		tmp.Width = w
-		tmp.Intensity = make([]uint16, 0)
+		tmp.Intensity = make([]uint16, 0, MAX_NEXRAD_BINS)
 
 		intensityData := f.FISB_data[3:]
 		for _, v := range intensityData {
 			intensity := uint16(v) & 0x7
 			runlength := (uint16(v) >> 3) + 1
-			for runlength > 0 {
+			for runlength > 0 && len(tmp.Intensity) < MAX_NEXRAD_BINS {
 				tmp.Intensity = append(tmp.Intensity, intensity)
 				runlength--
+			}
+			if len(tmp.Intensity) >= MAX_NEXRAD_BINS {
+				break
 			}
 		}
 		f.NEXRAD = []NEXRADBlock{tmp}
 	} else {
-		var row_start int
-		var row_size int
-		if block_num >= 405000 {
-			row_start = block_num - ((block_num - 405000) % 225)
-			row_size = 225
-		} else {
-			row_start = block_num - (block_num % 450)
-			row_size = 450
+		step := 1
+		if block_num >= BLOCK_THRESHOLD {
+			block_num = block_num & ^1
+			step = 2
 		}
-
+		row_size := BLOCKS_PER_RING
+		row_start := block_num - (block_num % row_size)
 		row_offset := block_num - row_start
 
 		L := int(f.FISB_data[3] & 15)
 
-		if len(f.FISB_data) < L+3 { // Short read.
+		if L == 0 || len(f.FISB_data) < L+3 { // Short read.
 			return
 		}
 
@@ -120,7 +124,7 @@ func (f *UATFrame) decodeNexradFrame() {
 
 			for j := 0; j < 8; j++ {
 				if bb&(1<<uint(j)) != 0 {
-					row_x := (row_offset + 8*i + j - 3) % row_size
+					row_x := (row_offset + (8*i+j-3)*step) % row_size
 					bn := row_start + row_x
 					lat, lon, h, w := block_location(bn, ns_flag, scale_factor)
 					var tmp NEXRADBlock

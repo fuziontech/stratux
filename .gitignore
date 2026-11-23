@@ -1,8 +1,13 @@
 .idea/
+build/
+dump978/dump978
 dump978/extract_nexrad
+dump978/fec_tests
 dump978/uat2esnt
 dump978/uat2json
 dump978/uat2text
+dump978/*.o
+dump978/fec/*.o
 stratuxrun
 gen_gdl90
 libdump978.so
@@ -20,6 +25,8 @@ ogn/esp32-ogn-tracker
 #*.zip
 
 test/bmp180_read
+test/real_read_bmp388
+test/replay_harness
 
 test/es_dump_csv
 

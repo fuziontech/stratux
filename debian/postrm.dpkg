@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+case "${1:-}" in
+	remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+		if [ -d /run/systemd/system ]; then
+			systemctl daemon-reload 2>/dev/null || true
+			if systemctl is-active --quiet avahi-daemon.service 2>/dev/null; then
+				systemctl reload avahi-daemon.service 2>/dev/null || true
+			fi
+		fi
+		;;
+esac
+
+exit 0

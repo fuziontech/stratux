@@ -18,52 +18,60 @@ import (
 type QueueEntry struct {
 	priority   int32
 	outdatedAt time.Time
-	data       interface{}
+	data       any
 }
-
 
 type MessageQueue struct {
 	maxSize       int
 	entries       []QueueEntry
+	prefixDropped int
 	DataAvailable chan bool
 	Closed        bool
 	mutex         sync.Mutex
 }
 
 func NewMessageQueue(maxSize int) *MessageQueue {
-	return &MessageQueue {
-		maxSize: maxSize,
-		entries: make([]QueueEntry, 0),
+	return &MessageQueue{
+		maxSize:       maxSize,
+		entries:       make([]QueueEntry, 0),
 		DataAvailable: make(chan bool, 1),
 	}
 }
 
-func (queue *MessageQueue) Put(prio int32, maxAge time.Duration, data interface{}) {
+func (queue *MessageQueue) IsClosed() bool {
+	queue.mutex.Lock()
+	defer queue.mutex.Unlock()
+	return queue.Closed
+}
+
+func (queue *MessageQueue) Put(prio int32, maxAge time.Duration, data any) {
+	queue.mutex.Lock()
+	defer queue.mutex.Unlock()
 	if queue.Closed {
 		return
 	}
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
 
-	timeout := stratuxClock.Time.Add(maxAge)
-	entry := QueueEntry { prio, timeout, data }
+	timeout := stratuxClock.GetTime().Add(maxAge)
+	entry := QueueEntry{prio, timeout, data}
 
-	if queue.entries == nil || len(queue.entries) == 0 {
+	if len(queue.entries) == 0 {
 		queue.entries = make([]QueueEntry, 1)
-		queue.entries[0] = QueueEntry { prio, timeout, data }
+		queue.entries[0] = entry
+		queue.prefixDropped = 0
 	} else {
 		index := queue.findInsertPosition(prio)
-		
+
 		if index == len(queue.entries) {
 			queue.entries = append(queue.entries, entry)
 		} else {
-			queue.entries = append(queue.entries[:index+1], queue.entries[index:]...)
+			queue.entries = append(queue.entries, QueueEntry{})
+			copy(queue.entries[index+1:], queue.entries[index:])
 			queue.entries[index] = entry
 		}
 	}
 
 	// Allow 10% over-use before we prune, so the pruning is done in batches to save CPU
-	if float32(len(queue.entries)) > float32(queue.maxSize) * 1.1 {
+	if queue.maxSize > 0 && float32(len(queue.entries)) > float32(queue.maxSize)*1.1 {
 		queue.prune()
 	}
 	if len(queue.entries) != 0 {
@@ -71,16 +79,15 @@ func (queue *MessageQueue) Put(prio int32, maxAge time.Duration, data interface{
 	}
 }
 
-func (queue *MessageQueue) PeekFirst() (interface{}, int32) {
+func (queue *MessageQueue) PeekFirst() (any, int32) {
 	return queue.getFirst(false)
 }
 
-
-func (queue *MessageQueue) PopFirst() (interface{}, int32) {
+func (queue *MessageQueue) PopFirst() (any, int32) {
 	return queue.getFirst(true)
 }
 
-func (queue *MessageQueue) getFirst(remove bool) (interface{}, int32) {
+func (queue *MessageQueue) getFirst(remove bool) (any, int32) {
 	queue.mutex.Lock()
 	defer queue.mutex.Unlock()
 
@@ -89,21 +96,36 @@ func (queue *MessageQueue) getFirst(remove bool) (interface{}, int32) {
 		return nil, 0 // nothing in queue
 	}
 
-	// found one. Strip the queue and return it
+	// Found one. Zero skipped/popped slots so payloads are eligible for GC.
 	entry := queue.entries[index]
-	if remove  {
-		queue.entries = queue.entries[index+1:]
-	} else {
-		queue.entries = queue.entries[index:]
+	dropCount := index
+	if remove {
+		queue.entries[index] = QueueEntry{}
+		dropCount = index + 1
 	}
+	queue.entries = queue.entries[dropCount:]
+	queue.prefixDropped += dropCount
+
+	if len(queue.entries) == 0 {
+		queue.entries = nil
+		queue.prefixDropped = 0
+	} else if queue.prefixDropped >= 64 && queue.prefixDropped >= len(queue.entries) {
+		compacted := make([]QueueEntry, len(queue.entries))
+		copy(compacted, queue.entries)
+		queue.entries = compacted
+		queue.prefixDropped = 0
+	}
+
 	return entry.data, entry.priority
 }
 
 // Returns the first entry that's not outdated
 func (queue *MessageQueue) getFirstUsableIndex() int {
+	now := stratuxClock.GetTime()
 	for i, data := range queue.entries {
-		if data.outdatedAt.Before(stratuxClock.Time) {
-			// entry already timed out..
+		if data.outdatedAt.Before(now) {
+			// Entry already timed out; zero slot to release payload reference.
+			queue.entries[i] = QueueEntry{}
 			continue
 		}
 		// found one
@@ -112,20 +134,21 @@ func (queue *MessageQueue) getFirstUsableIndex() int {
 
 	// Nothing current in queue
 	if len(queue.entries) > 0 {
-		queue.entries = make([]QueueEntry, 0)
+		queue.entries = nil
+		queue.prefixDropped = 0
 	}
 
 	return -1
 }
 
-func (queue *MessageQueue) GetQueueDump(pruneFirst bool) []interface{} {
+func (queue *MessageQueue) GetQueueDump(pruneFirst bool) []any {
 	queue.mutex.Lock()
 	defer queue.mutex.Unlock()
 
 	if pruneFirst {
 		queue.prune()
 	}
-	data := make([]interface{}, len(queue.entries))
+	data := make([]any, len(queue.entries))
 	for i, d := range queue.entries {
 		data[i] = d.data
 	}
@@ -136,13 +159,13 @@ func (queue *MessageQueue) GetQueueDump(pruneFirst bool) []interface{} {
 // - All outdated elements are discarded
 // - Low priority elements are discarded, starting with the oldest ones
 func (queue *MessageQueue) prune() {
-	// Group into priority categories, so we can then strip the beginning of each category is needed (remove oldest messages)
+	// Group into priority categories, so we can then strip the beginning of each category if needed (remove oldest messages)
 	newEntries := make([][]QueueEntry, 0)
-	//npruned := 0
 	totalUsable := 0
 	prevPrio := int32(999999999)
+	now := stratuxClock.GetTime()
 	for _, entry := range queue.entries {
-		if entry.outdatedAt.Before(stratuxClock.Time) {
+		if entry.outdatedAt.Before(now) {
 			continue // outdated, remove completely
 		}
 		totalUsable++
@@ -156,8 +179,7 @@ func (queue *MessageQueue) prune() {
 	toBeRemoved := totalUsable - queue.maxSize
 	if toBeRemoved > 0 {
 		for i := len(newEntries) - 1; i >= 0; i-- {
-			//fmt.Printf("%p: Pruning %d prio %d entries (%d available)\n", queue, toBeRemoved, newEntries[i][0].priority, len(newEntries[i]))
-			// From lowerst to highest prio, remove the oldest messages of each category until we have few enough in total
+			// From lowest to highest prio, remove the oldest messages of each category until we have few enough in total
 			if len(newEntries[i]) >= toBeRemoved {
 				// can remove enough in this category
 				newEntries[i] = newEntries[i][toBeRemoved:]
@@ -171,12 +193,17 @@ func (queue *MessageQueue) prune() {
 	}
 
 	// finally, copy everything back to our queue
-	queue.entries = make([]QueueEntry, 0)
+	kept := 0
+	for _, category := range newEntries {
+		kept += len(category)
+	}
+	queue.entries = make([]QueueEntry, 0, kept)
 	for _, category := range newEntries {
 		if category != nil {
 			queue.entries = append(queue.entries, category...)
 		}
 	}
+	queue.prefixDropped = 0
 }
 
 func (queue *MessageQueue) findInsertPosition(priority int32) int {
@@ -197,9 +224,13 @@ func (queue *MessageQueue) notifyData() {
 }
 
 func (queue *MessageQueue) Close() {
+	queue.mutex.Lock()
+	defer queue.mutex.Unlock()
 	if queue.Closed {
 		return
 	}
 	queue.Closed = true
+	queue.entries = nil
+	queue.prefixDropped = 0
 	queue.notifyData()
 }

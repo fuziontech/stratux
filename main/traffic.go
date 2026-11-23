@@ -89,7 +89,7 @@ type TrafficInfo struct {
 	Addr_type           uint8     // UAT address qualifier. Used by GDL90 format, so translations for ES TIS-B/ADS-R are needed.
 	TargetType          uint8     // types decribed in const above
 	SignalLevel         float64   // Signal level, dB RSSI.
-	SignalLevelHist     []float64 // last 8 values. For 1090ES we store the last 8 values here. SignalLevel will then become the minimum of these to get more stable data with antenna diversity
+	SignalLevelHist     []float64 // last 8 values. For 1090ES we store the last 8 values here. SignalLevel will then become the maximum of these to get more stable data with antenna diversity
 	Squawk              int       // Squawk code
 	Position_valid      bool      //TODO: set when position report received. Unset after n seconds?
 	Lat                 float32   // decimal common.Degrees, north positive
@@ -132,6 +132,13 @@ type TrafficInfo struct {
 	DistanceEstimatedLastTs time.Time // Used to compute moving average
 	ReceivedMsgs         uint64    // Number of messages received by this aircraft
 	IsStratux            bool      // Target is equipped with a Stratux that transmits via OGN tracker
+	AlertLevel           uint8     // 0=None, 1=Advisory, 2=Warning, 3=Urgent (3D CPA)
+	TimeToCPA            float64   // seconds to closest point of approach
+	HorizMissDist        float64   // predicted horizontal miss distance (meters)
+	VertMissDist         float64   // predicted vertical miss distance (feet)
+	Callout              string    // spoken/UI CPA callout phrase (debounced)
+	SourceConfidence     int       // fusion source confidence score (0-100)
+	FusedSources         []string  // list of fused source names (e.g. ["1090ES", "OGN"])
 	//FIXME: Rename variables for consistency, especially "Last_".
 }
 
@@ -172,6 +179,48 @@ var seenTraffic map[uint32]bool // Historical list of all ICAO addresses seen.
 
 var OwnshipTrafficInfo TrafficInfo
 
+const maxFusedSources = 8
+
+var (
+	cpaDebouncer          = NewCalloutDebouncer(15 * time.Second)
+	cpaLastPrune          time.Time
+	highestCPAThreatMu    sync.RWMutex
+	highestCPAThreat      CPAResult
+	highestCPAThreatKey   uint32
+	highestCPAThreatValid bool
+)
+
+func addFusedSource(ti *TrafficInfo, name string) {
+	if ti == nil || name == "" {
+		return
+	}
+	for _, existing := range ti.FusedSources {
+		if existing == name {
+			return
+		}
+	}
+	if len(ti.FusedSources) >= maxFusedSources {
+		return
+	}
+	ti.FusedSources = append(ti.FusedSources, name)
+}
+
+func setHighestCPAThreat(key uint32, res CPAResult, valid bool) {
+	highestCPAThreatMu.Lock()
+	highestCPAThreatKey = key
+	highestCPAThreat = res
+	highestCPAThreatValid = valid
+	highestCPAThreatMu.Unlock()
+}
+
+func getHighestCPAThreat() (CPAResult, bool) {
+	highestCPAThreatMu.RLock()
+	res := highestCPAThreat
+	valid := highestCPAThreatValid
+	highestCPAThreatMu.RUnlock()
+	return res, valid
+}
+
 func convertFeetToMeters(feet float32) float32 {
 	return feet * 0.3048
 }
@@ -194,15 +243,49 @@ func cleanupOldEntries() {
 }
 
 
+const maxSeenTrafficEntries = 50000
+
+// markTrafficSeen records an ICAO address in seenTraffic while keeping the map bounded.
+// Caller must hold trafficMutex.
+func markTrafficSeen(icao uint32) {
+	if seenTraffic == nil {
+		return
+	}
+	if _, exists := seenTraffic[icao]; exists {
+		return
+	}
+	if len(seenTraffic) >= maxSeenTrafficEntries {
+		// Prune entries that are no longer actively tracked to bound memory growth.
+		for k := range seenTraffic {
+			if _, active := traffic[k]; !active {
+				delete(seenTraffic, k)
+				if len(seenTraffic) < maxSeenTrafficEntries/2 {
+					break
+				}
+			}
+		}
+		if len(seenTraffic) >= maxSeenTrafficEntries {
+			return
+		}
+	}
+	seenTraffic[icao] = true
+}
+
 func removeTarget(id uint32) {
+	var removed TrafficInfo
+	var found bool
 	trafficMutex.Lock()
-	defer trafficMutex.Unlock()
 	if val, ok := traffic[id]; ok {
 		// Make sure the web interface times it out..
 		val.Age = 60
 		val.Position_valid = false
-		registerTrafficUpdate(val)
+		removed = val
+		found = true
 		delete(traffic, id)
+	}
+	trafficMutex.Unlock()
+	if found {
+		registerTrafficUpdate(removed)
 	}
 }
 
@@ -211,24 +294,37 @@ func removeTarget(id uint32) {
 // If the ti is very close and at same altitude, it is considered to be us
 // If it has no position information, we will not take it as ownship, but ignore its data (no mode-s detection for everything that is configured as ownship)
 func isOwnshipTrafficInfo(ti TrafficInfo) (isOwnshipInfo bool, shouldIgnore bool) {
+	globalStatusMutex.RLock()
+	gpsDetectedType := globalStatus.GPS_detected_type
+	ognPrevRandomAddr := globalStatus.OGNPrevRandomAddr
+	globalStatusMutex.RUnlock()
+
+	globalSettingsMutex.RLock()
+	ognAddr := globalSettings.OGNAddr
+	ownshipModeS := globalSettings.OwnshipModeS
+	debugEnabled := globalSettings.DEBUG
+	globalSettingsMutex.RUnlock()
+
 	// First, check if this is our own OGN tracker
-	
-	if (globalStatus.GPS_detected_type & 0x0f) == GPS_TYPE_OGNTRACKER {
-		ognTrackerCodeInt, _ := strconv.ParseUint(globalSettings.OGNAddr, 16, 32)
-		prevTrackerCodeInt, _ := strconv.ParseUint(globalStatus.OGNPrevRandomAddr, 16, 32)
-		if uint32(ognTrackerCodeInt) == ti.Icao_addr || uint32(prevTrackerCodeInt) == ti.Icao_addr {
+	if (gpsDetectedType & 0x0f) == GPS_TYPE_OGNTRACKER {
+		ognTrackerCodeInt, err1 := strconv.ParseUint(strings.TrimSpace(ognAddr), 16, 32)
+		prevTrackerCodeInt, err2 := strconv.ParseUint(strings.TrimSpace(ognPrevRandomAddr), 16, 32)
+		if (err1 == nil && ognTrackerCodeInt != 0 && uint32(ognTrackerCodeInt) == ti.Icao_addr) ||
+			(err2 == nil && prevTrackerCodeInt != 0 && uint32(prevTrackerCodeInt) == ti.Icao_addr) {
 			isOwnshipInfo = !isGPSValid() // only use OGN tracker as ownship position if we are not equipped with a GPS..
 			shouldIgnore = true
 			return
 		}
 	}
 
-
-	codes := strings.Split(globalSettings.OwnshipModeS, ",")
+	codes := strings.Split(ownshipModeS, ",")
 	shouldIgnore = false
 
 	for _, ownCode := range codes {
-		ownCodeInt, _ := strconv.ParseInt(strings.Trim(ownCode, " "), 16, 32)
+		ownCodeInt, err := strconv.ParseUint(strings.TrimSpace(ownCode), 16, 32)
+		if err != nil || ownCodeInt == 0 {
+			continue
+		}
 		if uint32(ownCodeInt) == ti.Icao_addr {
 			if !ti.Position_valid {
 				// Can't verify the ownship, ignore it for bearingless display
@@ -236,28 +332,39 @@ func isOwnshipTrafficInfo(ti TrafficInfo) (isOwnshipInfo bool, shouldIgnore bool
 				continue
 			}
 
+			gpsValid := isGPSValid()
+			mySituation.muGPS.Lock()
+			gpsLastTime := mySituation.GPSLastGPSTimeStratuxTime
+			gpsGroundSpeed := mySituation.GPSGroundSpeed
+			gpsLat := mySituation.GPSLatitude
+			gpsLng := mySituation.GPSLongitude
+			gpsHAE := mySituation.GPSHeightAboveEllipsoid
+			gpsHAcc := mySituation.GPSHorizontalAccuracy
+			mySituation.muGPS.Unlock()
+
+			mySituation.muBaro.Lock()
+			baroAlt := mySituation.BaroPressureAltitude
+			mySituation.muBaro.Unlock()
+
 			// User might have specified the address of another airplane that he regularly flys.
 			// If this airplane is currently in the air and we receive it, it gets priority over our ownship information.
-			// This is a sanity check to filter out such cases - only accept the ownship data if 
+			// This is a sanity check to filter out such cases - only accept the ownship data if
 			// it somewhat matches our real data
 			// because of second-resolution in flarm we assume worst case of +1 second
-			timeDiff := math.Abs(ti.Age - stratuxClock.Since(mySituation.GPSLastGPSTimeStratuxTime).Seconds()) + 1
-			//if ti.ExtrapolatedPosition {
-			//	timeDiff = math.Abs(ti.AgeExtrapolation - stratuxClock.Since(mySituation.GPSLastGPSTimeStratuxTime).Seconds()) + 1
-			//}
-			speed := mySituation.GPSGroundSpeed
+			timeDiff := math.Abs(ti.Age-stratuxClock.Since(gpsLastTime).Seconds()) + 1
+			speed := gpsGroundSpeed
 			if ti.Speed_valid {
-				speed = math.Max(float64(ti.Speed), mySituation.GPSGroundSpeed)
+				speed = math.Max(float64(ti.Speed), gpsGroundSpeed)
 			}
 			trafficDist := 0.0
-			if isGPSValid() {
-				trafficDist, _, _, _ = common.DistRect(float64(mySituation.GPSLatitude), float64(mySituation.GPSLongitude), float64(ti.Lat), float64(ti.Lng))
+			if gpsValid {
+				trafficDist, _, _, _ = common.DistRect(float64(gpsLat), float64(gpsLng), float64(ti.Lat), float64(ti.Lng))
 			}
 			altDiff := 99999.0
-			if ti.AltIsGNSS && ti.Alt != 0 {
-				altDiff = math.Abs(float64(mySituation.GPSHeightAboveEllipsoid) - float64(ti.Alt))
+			if ti.AltIsGNSS && gpsValid && ti.Alt != 0 {
+				altDiff = math.Abs(float64(gpsHAE) - float64(ti.Alt))
 			} else if isTempPressValid() && ti.Alt != 0 {
-				altDiff = math.Abs(float64(mySituation.BaroPressureAltitude - float32(ti.Alt)))
+				altDiff = math.Abs(float64(baroAlt - float32(ti.Alt)))
 			} else {
 				// Cant verify relative altitude.. ignore it but don't use
 				shouldIgnore = true
@@ -265,12 +372,12 @@ func isOwnshipTrafficInfo(ti TrafficInfo) (isOwnshipInfo bool, shouldIgnore bool
 			}
 
 			// Check if the distance to the ti is plausible
-			maxDistMetersIgnore := (timeDiff * speed * 0.514444 + float64(mySituation.GPSHorizontalAccuracy) + 50) * 3
+			maxDistMetersIgnore := (timeDiff*speed*0.514444 + float64(gpsHAcc) + 50) * 3
 			if trafficDist > maxDistMetersIgnore {
 				log.Printf("Skipping ownship %s because it's too far away (%fm, speed=%f, max=%f)", ownCode, trafficDist, speed, maxDistMetersIgnore)
 				continue
 			}
-			
+
 			// If we have a pressure sensor, and the pressure altitude of traffic and ownship is too big, skip...
 			if altDiff > 500 {
 				log.Printf("Skipping ownship %s because the altitude is off (%f ft)", ownCode, altDiff)
@@ -279,11 +386,11 @@ func isOwnshipTrafficInfo(ti TrafficInfo) (isOwnshipInfo bool, shouldIgnore bool
 
 			// To really use the information from the ownship traffic info, we have much more
 			// strict requirements. At most 5s old and must be much closer
-			maxDistMetersOwnship :=  (timeDiff * speed * 0.514444 + float64(mySituation.GPSHorizontalAccuracy) + 20) * 1.4
-			if !isGPSValid() || (ti.Age <= 5 && trafficDist < maxDistMetersOwnship) && !ti.AltIsGNSS {
+			maxDistMetersOwnship := (timeDiff*speed*0.514444 + float64(gpsHAcc) + 20) * 1.4
+			if (!gpsValid || (ti.Age <= 5 && trafficDist < maxDistMetersOwnship)) && !ti.AltIsGNSS {
 				isOwnshipInfo = true
 			}
-			if globalSettings.DEBUG {
+			if debugEnabled {
 				log.Printf("Using ownship %s. MaxDistIgnore: %f, maxDistOwnShip: %f, dist: %f, altDiff: %f, speed: %f, timeDiffS: %f, useForInfo: %t",
 					ownCode, maxDistMetersIgnore, maxDistMetersOwnship, trafficDist, altDiff, speed, timeDiff, isOwnshipInfo)
 			}
@@ -296,143 +403,264 @@ func isOwnshipTrafficInfo(ti TrafficInfo) (isOwnshipInfo bool, shouldIgnore bool
 }
 
 func sendTrafficUpdates() {
-	trafficMutex.Lock()
-	defer trafficMutex.Unlock()
-	cleanupOldEntries()
+	var trafficBroadcasts []TrafficInfo
+	var radarBroadcasts []TrafficInfo
 
-	// Summarize number of UAT and 1090ES traffic targets for reports that follow.
-	globalStatus.UAT_traffic_targets_tracking = 0
-	globalStatus.ES_traffic_targets_tracking = 0
-	for _, traf := range traffic {
-		switch traf.Last_source {
-		case TRAFFIC_SOURCE_1090ES:
-			globalStatus.ES_traffic_targets_tracking++
-		case TRAFFIC_SOURCE_UAT:
-			globalStatus.UAT_traffic_targets_tracking++
-		}
+	globalSettingsMutex.RLock()
+	debugEnabled := globalSettings.DEBUG
+	radarLimits := globalSettings.RadarLimits
+	radarRange := globalSettings.RadarRange
+	estimateBearinglessDist := globalSettings.EstimateBearinglessDist
+	cpaAlertsEnabled := globalSettings.CPA_Alerts_Enabled
+	globalSettingsMutex.RUnlock()
+
+	var currAlt, baroVvel float32
+	if mySituation.muBaro != nil {
+		mySituation.muBaro.Lock()
+		currAlt = mySituation.BaroPressureAltitude
+		baroVvel = mySituation.BaroVerticalSpeed
+		mySituation.muBaro.Unlock()
+	} else {
+		currAlt = mySituation.BaroPressureAltitude
+		baroVvel = mySituation.BaroVerticalSpeed
 	}
 
-	var currAlt float32
-	currAlt = mySituation.BaroPressureAltitude
-	if currAlt == 99999 {   // no valid BaroAlt, take GPS instead, better than nothing
-		currAlt = mySituation.GPSAltitudeMSL
+	var gpsLat, gpsLng, gpsAltMSL, gpsCourse, gpsVvelFps float32
+	var gpsSpeedKt float64
+	if mySituation.muGPS != nil {
+		mySituation.muGPS.Lock()
+		gpsLat = mySituation.GPSLatitude
+		gpsLng = mySituation.GPSLongitude
+		gpsAltMSL = mySituation.GPSAltitudeMSL
+		gpsCourse = mySituation.GPSTrueCourse
+		gpsSpeedKt = mySituation.GPSGroundSpeed
+		gpsVvelFps = mySituation.GPSVerticalSpeed
+		mySituation.muGPS.Unlock()
+	} else {
+		gpsLat = mySituation.GPSLatitude
+		gpsLng = mySituation.GPSLongitude
+		gpsAltMSL = mySituation.GPSAltitudeMSL
+		gpsCourse = mySituation.GPSTrueCourse
+		gpsSpeedKt = mySituation.GPSGroundSpeed
+		gpsVvelFps = mySituation.GPSVerticalSpeed
 	}
 
-	var bestEstimate TrafficInfo
-	var highestAlarmLevel uint8
-	var highestAlarmTraffic TrafficInfo
-
-	if globalSettings.DEBUG && (stratuxClock.Time.Second()%15) == 0 {
-		log.Printf("List of all aircraft being tracked:\n")
-		log.Printf("==================================================================\n")
+	gpsValid := isGPSValid()
+	baroValid := isTempPressValid()
+	if currAlt == 99999 { // no valid BaroAlt, take GPS instead, better than nothing
+		currAlt = gpsAltMSL
 	}
-	for key, ti := range traffic { // ForeFlight 7.5 chokes at ~1000-2000 messages depending on iDevice RAM. Practical limit likely around ~500 aircraft without filtering.
-		if isGPSValid() && ti.Position_valid {
-			// func distRect(lat1, lon1, lat2, lon2 float64) (dist, bearing, distN, distE float64) {
-			dist, bearing := common.Distance(float64(mySituation.GPSLatitude), float64(mySituation.GPSLongitude), float64(ti.Lat), float64(ti.Lng))
-			ti.Distance = dist
-			ti.Bearing = bearing
-			ti.BearingDist_valid = true
-		} else {
-			ti.Distance = 0
-			ti.Bearing = 0
-			ti.BearingDist_valid = false
-		}
-		ti.Age = stratuxClock.Since(ti.Last_seen).Seconds()
-		ti.AgeExtrapolation = stratuxClock.Since(ti.Last_extrapolation).Seconds()
-		ti.AgeLastAlt = stratuxClock.Since(ti.Last_alt).Seconds()
+	ownAltFt := float64(currAlt)
+	if !baroValid {
+		ownAltFt = float64(gpsAltMSL)
+	}
+	ownVvelFpm := float64(gpsVvelFps) * 60.0
+	if baroValid {
+		ownVvelFpm = float64(baroVvel)
+	}
+	ownTrackDeg := float64(gpsCourse)
+	ownSpeedKt := gpsSpeedKt
 
-		// Keep non-extrapolated traffic for 6 seconds, but extrapolate for 20
-		isCurrent := (ti.ExtrapolatedPosition && ti.AgeExtrapolation < 2 && ti.Age < 25) || (!ti.ExtrapolatedPosition && ti.Age < 6)
+	var uatTracking uint16
+	var esTracking uint16
 
-		isOwnshipTi, shouldIgnore := isOwnshipTrafficInfo(ti)
+	func() {
+		trafficMutex.Lock()
+		defer trafficMutex.Unlock()
+		cleanupOldEntries()
 
-		// As bearingless targets, we show the closest estimated traffic that is between +-2000ft
-		if !shouldIgnore && !ti.Position_valid && ti.DistanceEstimated > 0 &&
-			(bestEstimate.DistanceEstimated == 0 || ti.DistanceEstimated < bestEstimate.DistanceEstimated) {
-			if ti.Alt != 0 && math.Abs(float64(ti.Alt) - float64(currAlt)) < 2000 {
-				bestEstimate = ti
+		// Summarize number of UAT and 1090ES traffic targets for reports that follow.
+		for _, traf := range traffic {
+			switch traf.Last_source {
+			case TRAFFIC_SOURCE_1090ES:
+				esTracking++
+			case TRAFFIC_SOURCE_UAT:
+				uatTracking++
 			}
 		}
 
-		// DEBUG: Print the list of all tracked targets (with data) to the log every 15 seconds if "DEBUG" option is enabled
-		if globalSettings.DEBUG && (stratuxClock.Time.Second()%15) == 0 {
-			s_out, err := json.Marshal(ti)
-			if err != nil {
-				log.Printf("Error generating output: %s\n", err.Error())
+		var bestEstimate TrafficInfo
+		var highestAlarmLevel uint8
+		var highestAlarmTraffic TrafficInfo
+
+		nowMono := stratuxClock.GetTime()
+		nowSec := nowMono.Second()
+		cpaCfg := DefaultCPAConfig()
+		ownOnGround := OwnshipTrafficInfo.Position_valid && OwnshipTrafficInfo.OnGround
+		var cpaResults map[uint32]CPAResult
+		if cpaAlertsEnabled && gpsValid {
+			cpaResults = make(map[uint32]CPAResult)
+		}
+
+		if debugEnabled && (nowSec%15) == 0 {
+			log.Printf("List of all aircraft being tracked:\n")
+			log.Printf("==================================================================\n")
+		}
+		for key, ti := range traffic { // ForeFlight 7.5 chokes at ~1000-2000 messages depending on iDevice RAM. Practical limit likely around ~500 aircraft without filtering.
+			if gpsValid && ti.Position_valid {
+				dist, bearing := common.Distance(float64(gpsLat), float64(gpsLng), float64(ti.Lat), float64(ti.Lng))
+				ti.Distance = dist
+				ti.Bearing = bearing
+				ti.BearingDist_valid = true
 			} else {
-				log.Printf("%X => %s\n", ti.Icao_addr, string(s_out))
+				ti.Distance = 0
+				ti.Bearing = 0
+				ti.BearingDist_valid = false
 			}
-			// end of debug block
-		}
-		traffic[key] = ti // write the updated ti back to the map
-		//log.Printf("Traffic age of %X is %f seconds\n",icao,ti.Age)
-		if ti.Age > 2 { // if nothing polls an inactive ti, it won't push to the webUI, and its Age won't update.
-			trafficUpdate.SendJSON(ti)
-		}
-		if !shouldIgnore && isCurrent {
-			if float32(ti.Alt) <= currAlt + float32(globalSettings.RadarLimits) * 1.3 && //take 30% more to see moving outs
-			   float32(ti.Alt) >= currAlt - float32(globalSettings.RadarLimits) * 1.3 && // altitude lower than upper boundary
-			   (!ti.Position_valid || ti.Distance<float64(globalSettings.RadarRange) * 1852.0 * 1.3) {    //allow more so that aircraft moves out
-				radarUpdate.SendJSON(ti)
-			}
-		}
-		if ti.Position_valid && isCurrent { // ... but don't pass stale data to the EFB.
-			//TODO: Coast old traffic? Need to determine how FF, WingX, etc deal with stale targets.
-			logTraffic(ti) // only add to the SQLite log if it's not stale
+			ti.Age = stratuxClock.Since(ti.Last_seen).Seconds()
+			ti.AgeExtrapolation = stratuxClock.Since(ti.Last_extrapolation).Seconds()
+			ti.AgeLastAlt = stratuxClock.Since(ti.Last_alt).Seconds()
 
-			if isOwnshipTi {
-				if globalSettings.DEBUG {
-					log.Printf("Ownship target detected for code %X\n", ti.Icao_addr)
-				}
-				OwnshipTrafficInfo = ti
-			} else if !shouldIgnore {
-				priority := computeTrafficPriority(&ti)
-				sendGDL90(makeTrafficReportMsg(ti), time.Second, priority)
-				thisMsgFLARM, validFLARM, alarmLevel := makeFlarmPFLAAString(ti)
-				if alarmLevel > highestAlarmLevel {
-					highestAlarmLevel = alarmLevel
-					highestAlarmTraffic = ti
-				}
+			// Keep non-extrapolated traffic for 6 seconds, but extrapolate for 20
+			isCurrent := (ti.ExtrapolatedPosition && ti.AgeExtrapolation < 2 && ti.Age < 25) || (!ti.ExtrapolatedPosition && ti.Age < 6)
 
-				var trafficCallsign string
-				if len(ti.Tail) > 0 {
-					trafficCallsign = ti.Tail
+			isOwnshipTi, shouldIgnore := isOwnshipTrafficInfo(ti)
+
+			if cpaAlertsEnabled && gpsValid && !isOwnshipTi && !shouldIgnore && ti.Position_valid && isCurrent {
+				res := ComputeCPA(
+					float64(gpsLat), float64(gpsLng), ownAltFt,
+					ownTrackDeg, ownSpeedKt, ownVvelFpm,
+					ownOnGround, ti, cpaCfg,
+				)
+				if res.Valid {
+					ti.AlertLevel = res.AlertLevel
+					ti.TimeToCPA = res.TimeToCPASec
+					ti.HorizMissDist = res.HorizMissMeters
+					ti.VertMissDist = res.VertMissFeet
+					if res.AlertLevel == CPAAlertNone {
+						ti.Callout = ""
+					} else if cpaDebouncer.ShouldAnnounce(key, res, nowMono) {
+						ti.Callout = res.Callout
+					}
+					cpaResults[key] = res
 				} else {
-					trafficCallsign = fmt.Sprintf("%X_%d", ti.Icao_addr, ti.Squawk)
+					ti.AlertLevel = CPAAlertNone
+					ti.TimeToCPA = 0
+					ti.HorizMissDist = 0
+					ti.VertMissDist = 0
+					ti.Callout = ""
 				}
+			} else {
+				ti.AlertLevel = CPAAlertNone
+				ti.TimeToCPA = 0
+				ti.HorizMissDist = 0
+				ti.VertMissDist = 0
+				ti.Callout = ""
+			}
 
-				// send traffic message to X-Plane
-				sendXPlane(createXPlaneTrafficMsg(ti.Icao_addr, ti.Lat, ti.Lng, ti.Alt, uint32(ti.Speed), int32(ti.Vvel), ti.OnGround, uint32(ti.Track), trafficCallsign), 1000, priority)
-				if validFLARM {
-					sendNetFLARM(thisMsgFLARM, time.Second, priority)
+			// As bearingless targets, we show the closest recent estimated traffic that is between +-2000ft
+			if !shouldIgnore && !ti.Position_valid && ti.Age < 6 && ti.DistanceEstimated > 0 &&
+				(bestEstimate.DistanceEstimated == 0 || ti.DistanceEstimated < bestEstimate.DistanceEstimated) {
+				if ti.Alt != 0 && math.Abs(float64(ti.Alt)-float64(currAlt)) < 2000 {
+					bestEstimate = ti
+				}
+			}
+
+			// DEBUG: Print the list of all tracked targets (with data) to the log every 15 seconds if "DEBUG" option is enabled
+			if debugEnabled && (nowSec%15) == 0 {
+				s_out, err := json.Marshal(ti)
+				if err != nil {
+					log.Printf("Error generating output: %s\n", err.Error())
+				} else {
+					log.Printf("%X => %s\n", ti.Icao_addr, string(s_out))
+				}
+			}
+			traffic[key] = ti // write the updated ti back to the map
+			if ti.Age > 2 {   // if nothing polls an inactive ti, it won't push to the webUI, and its Age won't update.
+				trafficBroadcasts = append(trafficBroadcasts, ti)
+			}
+			if !shouldIgnore && isCurrent {
+				if float32(ti.Alt) <= currAlt+float32(radarLimits)*1.3 && //take 30% more to see moving outs
+					float32(ti.Alt) >= currAlt-float32(radarLimits)*1.3 && // altitude lower than upper boundary
+					(!ti.Position_valid || ti.Distance < float64(radarRange)*1852.0*1.3) { //allow more so that aircraft moves out
+					radarBroadcasts = append(radarBroadcasts, ti)
+				}
+			}
+			if ti.Position_valid && isCurrent { // ... but don't pass stale data to the EFB.
+				//TODO: Coast old traffic? Need to determine how FF, WingX, etc deal with stale targets.
+				logTraffic(ti) // only add to the SQLite log if it's not stale
+
+				if isOwnshipTi {
+					if debugEnabled {
+						log.Printf("Ownship target detected for code %X\n", ti.Icao_addr)
+					}
+					OwnshipTrafficInfo = ti
+				} else if !shouldIgnore {
+					priority := computeTrafficPriority(&ti)
+					sendGDL90(makeTrafficReportMsg(ti), time.Second, priority)
+					thisMsgFLARM, validFLARM, alarmLevel := makeFlarmPFLAAString(ti)
+					if alarmLevel > highestAlarmLevel {
+						highestAlarmLevel = alarmLevel
+						highestAlarmTraffic = ti
+					}
+
+					var trafficCallsign string
+					if len(ti.Tail) > 0 {
+						trafficCallsign = ti.Tail
+					} else {
+						trafficCallsign = fmt.Sprintf("%X_%d", ti.Icao_addr, ti.Squawk)
+					}
+
+					// send traffic message to X-Plane
+					sendXPlane(createXPlaneTrafficMsg(ti.Icao_addr, ti.Lat, ti.Lng, ti.Alt, uint32(ti.Speed), int32(ti.Vvel), ti.OnGround, uint32(ti.Track), trafficCallsign), time.Second, priority)
+					if validFLARM {
+						sendNetFLARM(thisMsgFLARM, time.Second, priority)
+					}
 				}
 			}
 		}
-	}
 
-	// Also send the nearest best bearingless
-	if bestEstimate.DistanceEstimated > 0 && bestEstimate.DistanceEstimated < 15000 {
-		if isGPSValid() {
-			if globalSettings.EstimateBearinglessDist {
-				fakeTargets := calculateModeSFakeTargets(bestEstimate)
-				fakeMsg :=  make([]byte, 0)
-				for _, ti := range fakeTargets {
-					fakeMsg = append(fakeMsg, makeTrafficReportMsg(ti)...)
+		if cpaAlertsEnabled && gpsValid {
+			bestKey, bestRes, hasThreat := SelectHighestThreat(cpaResults)
+			setHighestCPAThreat(bestKey, bestRes, hasThreat)
+			if hasThreat {
+				if threatTi, ok := traffic[bestKey]; ok {
+					highestAlarmTraffic = threatTi
 				}
-				prio := computeTrafficPriority(&fakeTargets[0])
-				sendGDL90(fakeMsg, time.Second, prio)
 			}
-			prio := computeTrafficPriority(&bestEstimate)
-			msg, valid, _ := makeFlarmPFLAAString(bestEstimate)
-			if valid { 
-				sendNetFLARM(msg, time.Second, prio)
+			if cpaLastPrune.IsZero() || nowMono.Sub(cpaLastPrune) >= 60*time.Second {
+				cpaDebouncer.Prune(nowMono, 2*time.Minute)
+				cpaLastPrune = nowMono
+			}
+		} else {
+			setHighestCPAThreat(0, CPAResult{}, false)
+		}
+
+		// Also send the nearest best bearingless
+		if bestEstimate.DistanceEstimated > 0 && bestEstimate.DistanceEstimated < 15000 {
+			if gpsValid {
+				if estimateBearinglessDist {
+					fakeTargets := calculateModeSFakeTargets(bestEstimate)
+					fakeMsg := make([]byte, 0)
+					for _, ti := range fakeTargets {
+						fakeMsg = append(fakeMsg, makeTrafficReportMsg(ti)...)
+					}
+					prio := computeTrafficPriority(&fakeTargets[0])
+					sendGDL90(fakeMsg, time.Second, prio)
+				}
+				prio := computeTrafficPriority(&bestEstimate)
+				msg, valid, _ := makeFlarmPFLAAString(bestEstimate)
+				if valid {
+					sendNetFLARM(msg, time.Second, prio)
+				}
 			}
 		}
-	}
 
-	msgPFLAU := makeFlarmPFLAUString(highestAlarmTraffic)
-	sendNetFLARM(msgPFLAU, time.Second, 0)
+		msgPFLAU := makeFlarmPFLAUString(highestAlarmTraffic)
+		sendNetFLARM(msgPFLAU, time.Second, 0)
+	}()
+
+	globalStatusMutex.Lock()
+	globalStatus.UAT_traffic_targets_tracking = uatTracking
+	globalStatus.ES_traffic_targets_tracking = esTracking
+	globalStatusMutex.Unlock()
+
+	for _, ti := range trafficBroadcasts {
+		trafficUpdate.SendJSON(ti)
+	}
+	for _, ti := range radarBroadcasts {
+		radarUpdate.SendJSON(ti)
+	}
 }
 
 func computeTrafficPriority(ti *TrafficInfo) int32 {
@@ -458,29 +686,48 @@ func computeTrafficPriority(ti *TrafficInfo) int32 {
 // This is only a wild guess, but seems to help a bit. To do so, we use different estimatedDistFactors for different
 // altitude buckets: <5000ft, 5000-10000ft, >10000ft
 var estimatedDistFactors [3]float64 = [3]float64{2500.0, 2800.0, 3000.0}
+
 func estimateDistance(ti *TrafficInfo) {
 	if ti.Last_source != TRAFFIC_SOURCE_1090ES {
 		return
 	}
-	altClass := int32(math.Max(0.0, math.Min(float64(ti.Alt / 5000), 2.0)))
-	dist := math.Pow(2.0, -ti.SignalLevel / 6.0) * estimatedDistFactors[altClass];  // distance approx. in meters, 6dB for double distance
-
-	lambda := 0.2;
-	timeDiff := ti.Timestamp.Sub(ti.DistanceEstimatedLastTs).Seconds() * 1000
-	ti.DistanceEstimatedLastTs = ti.Timestamp
-	if timeDiff < 0.0 {
+	if ti.SignalLevel <= -100 || math.IsNaN(ti.SignalLevel) || math.IsInf(ti.SignalLevel, 0) {
 		return
 	}
-	
+	altClass := int32(math.Max(0.0, math.Min(float64(ti.Alt/5000), 2.0)))
+	dist := math.Pow(2.0, -ti.SignalLevel/6.0) * estimatedDistFactors[altClass] // distance approx. in meters, 6dB for double distance
+	if math.IsNaN(dist) || math.IsInf(dist, 0) || dist <= 0 {
+		return
+	}
 
-	expon := math.Exp(-timeDiff / 100 * lambda);
-	//log.Printf("timediff: %f, expon: %f", timeDiff, expon)
-	ti.DistanceEstimated = ti.DistanceEstimated * expon + dist * (1 - expon);
+	lambda := 0.2
+	now := stratuxClock.GetTime()
+	if ti.DistanceEstimatedLastTs.IsZero() {
+		ti.DistanceEstimatedLastTs = now
+		ti.DistanceEstimated = dist
+	} else {
+		timeDiff := now.Sub(ti.DistanceEstimatedLastTs).Seconds() * 1000
+		ti.DistanceEstimatedLastTs = now
+		if timeDiff < 0.0 {
+			return
+		}
+		expon := math.Exp(-timeDiff / 100 * lambda)
+		if math.IsNaN(ti.DistanceEstimated) || math.IsInf(ti.DistanceEstimated, 0) || ti.DistanceEstimated <= 0 {
+			ti.DistanceEstimated = dist
+		} else {
+			ti.DistanceEstimated = ti.DistanceEstimated*expon + dist*(1-expon)
+		}
+	}
+
+	if ti.DistanceEstimated <= 0 || math.IsNaN(ti.DistanceEstimated) || math.IsInf(ti.DistanceEstimated, 0) {
+		return
+	}
 
 	// Only learn from 1090ES ADS-B targets
 	// We ignore targets that are too far away (a lot of signal strength fluctuation), too close (non-reception cone or ownship)
 	// and of course extrapolated targets and invalid signal levels
-	if ti.BearingDist_valid && ti.Distance < 50000 && ti.Distance > 1500 && ti.Last_source == TRAFFIC_SOURCE_1090ES &&
+	if ti.BearingDist_valid && !math.IsNaN(ti.Distance) && !math.IsInf(ti.Distance, 0) &&
+		ti.Distance < 50000 && ti.Distance > 1500 && ti.Last_source == TRAFFIC_SOURCE_1090ES &&
 		ti.TargetType == TARGET_TYPE_ADSB && ti.SignalLevel > -30 && ti.SignalLevel < 0 && !ti.ExtrapolatedPosition {
 		var errorFactor float64
 		if ti.DistanceEstimated > ti.Distance {
@@ -488,25 +735,43 @@ func estimateDistance(ti *TrafficInfo) {
 		} else {
 			errorFactor = ti.Distance / ti.DistanceEstimated
 		}
+		if math.IsNaN(errorFactor) || math.IsInf(errorFactor, 0) {
+			return
+		}
+		if errorFactor > 50.0 {
+			errorFactor = 50.0
+		} else if errorFactor < -50.0 {
+			errorFactor = -50.0
+		}
 		estimatedDistFactors[altClass] += errorFactor
-		//log.Printf("Estimate off: %f, new factor: %f", errorFactor, estimatedDistFactor)
-		if (estimatedDistFactors[altClass] < 1.0) {
+		if estimatedDistFactors[altClass] < 1.0 || math.IsNaN(estimatedDistFactors[altClass]) {
 			estimatedDistFactors[altClass] = 1.0
+		} else if estimatedDistFactors[altClass] > 100000.0 || math.IsInf(estimatedDistFactors[altClass], 0) {
+			estimatedDistFactors[altClass] = 100000.0
 		}
 	}
-
 }
 
- // calculates coordinates of a point defined by a location, a bearing, and a distance, thanks to 0x74-0x62
+// calculates coordinates of a point defined by a location, a bearing, and a distance, thanks to 0x74-0x62
 func calcLocationForBearingDistance(lat1, lon1, bearingDeg, distanceNm float64) (lat2, lon2 float64) {
 	lat1Rad := common.Radians(lat1)
 	lon1Rad := common.Radians(lon1)
 	bearingRad := common.Radians(bearingDeg)
 	distanceRad := distanceNm / (180 * 60 / math.Pi)
 
-	lat2Rad := math.Asin(math.Sin(lat1Rad)*math.Cos(distanceRad) + math.Cos(lat1Rad)*math.Sin(distanceRad)*math.Cos(bearingRad))
+	sinLat2 := math.Sin(lat1Rad)*math.Cos(distanceRad) + math.Cos(lat1Rad)*math.Sin(distanceRad)*math.Cos(bearingRad)
+	if sinLat2 > 1.0 {
+		sinLat2 = 1.0
+	} else if sinLat2 < -1.0 {
+		sinLat2 = -1.0
+	}
+	lat2Rad := math.Asin(sinLat2)
 	distanceLon := -math.Atan2(math.Sin(bearingRad)*math.Sin(distanceRad)*math.Cos(lat1Rad), math.Cos(distanceRad)-math.Sin(lat1Rad)*math.Sin(lat2Rad))
-	lon2Rad := math.Mod(lon1Rad-distanceLon+math.Pi, 2.0*math.Pi) - math.Pi
+	lon2Rad := math.Mod(lon1Rad-distanceLon+math.Pi, 2.0*math.Pi)
+	if lon2Rad < 0 {
+		lon2Rad += 2.0 * math.Pi
+	}
+	lon2Rad -= math.Pi
 
 	lat2 = common.Degrees(lat2Rad)
 	lon2 = common.Degrees(lon2Rad)
@@ -566,11 +831,20 @@ func makeTrafficReportMsg(ti TrafficInfo) []byte {
 	// See p.16.
 	msg[0] = 0x14 // Message type "Traffic Report".
 
-	// Address type
-	msg[1] = ti.Addr_type
+	// Address type (lower nibble); upper nibble is Traffic Alert status per GDL90 ICD pg. 18.
+	msg[1] = ti.Addr_type & 0x0F
+
+	globalSettingsMutex.RLock()
+	cpaAlertsEnabled := globalSettings.CPA_Alerts_Enabled
+	globalSettingsMutex.RUnlock()
 
 	// Set alert if needed
-	if isTrafficAlertable(ti) {
+	if cpaAlertsEnabled {
+		if ti.AlertLevel >= CPAAlertWarning {
+			// Set the alert bit. See pg. 18 of GDL90 ICD.
+			msg[1] |= 0x10
+		}
+	} else if isTrafficAlertable(ti) {
 		// Set the alert bit.  See pg. 18 of GDL90 ICD
 		msg[1] |= 0x10
 	}
@@ -607,10 +881,18 @@ func makeTrafficReportMsg(ti TrafficInfo) []byte {
 	//
 	// GDL90 expects barometric altitude in traffic reports
 	var baroAlt int32
-	if ti.AltIsGNSS && isTempPressValid() {
+	if ti.AltIsGNSS && isTempPressValid() && isGPSValid() {
+		mySituation.muGPS.Lock()
+		geoidSep := mySituation.GPSGeoidSep
+		gpsAltMSL := mySituation.GPSAltitudeMSL
+		mySituation.muGPS.Unlock()
+		mySituation.muBaro.Lock()
+		ownBaroAlt := mySituation.BaroPressureAltitude
+		mySituation.muBaro.Unlock()
+
 		// Convert from GPS geoid height to barometric altitude
-		baroAlt = ti.Alt - int32(mySituation.GPSGeoidSep)
-		baroAlt = baroAlt - int32(mySituation.GPSAltitudeMSL) + int32(mySituation.BaroPressureAltitude)
+		baroAlt = ti.Alt - int32(geoidSep)
+		baroAlt = baroAlt - int32(gpsAltMSL) + int32(ownBaroAlt)
 	} else {
 		baroAlt = ti.Alt
 	}
@@ -650,23 +932,42 @@ func makeTrafficReportMsg(ti TrafficInfo) []byte {
 	// Position containment / navigational accuracy
 	msg[13] = ((byte(ti.NIC) << 4) & 0xF0) | (byte(ti.NACp) & 0x0F)
 
-	// Horizontal velocity (speed).
+	// Horizontal velocity (speed): 0x000..0xFFE valid, 0xFFF invalid.
+	speed := uint16(0xFFF)
+	if ti.Speed_valid {
+		speed = ti.Speed
+		if speed > 0xFFE {
+			speed = 0xFFE
+		}
+	}
+	msg[14] = byte((speed & 0x0FF0) >> 4)
+	msg[15] = byte((speed & 0x000F) << 4)
 
-	msg[14] = byte((ti.Speed & 0x0FF0) >> 4)
-	msg[15] = byte((ti.Speed & 0x000F) << 4)
-
-	// Vertical velocity.
-	vvel := ti.Vvel / 64 // 64fpm resolution.
+	// Vertical velocity (64fpm resolution, signed 12-bit, 0x800 reserved for unavailable).
+	vvel := ti.Vvel / 64
+	if vvel > 511 {
+		vvel = 511
+	} else if vvel < -511 {
+		vvel = -511
+	}
 	msg[15] = msg[15] | byte((vvel&0x0F00)>>8)
 	msg[16] = byte(vvel & 0x00FF)
 
-	// Track.
-	trk := uint8(ti.Track / TRACK_RESOLUTION) // Resolution is ~1.4 common.Degrees.
+	// Track: normalize and round to nearest 8-bit bin.
+	tempTrack := normalizeAngle360(float64(ti.Track) + float64(TRACK_RESOLUTION)/2.0)
+	trk := uint8(int(tempTrack/float64(TRACK_RESOLUTION)) & 0xFF) // Resolution is ~1.4 common.Degrees.
 	msg[17] = byte(trk)
 
-	msg[18] = ti.Emitter_category
+	emitterCat := ti.Emitter_category
+	if emitterCat == 0 && ti.TargetType == TARGET_TYPE_REMOTEID {
+		emitterCat = 14 // GDL90 UAV emitter category
+	}
+	msg[18] = emitterCat
 
-	// msg[19] to msg[26] are "call sign" (tail).
+	// msg[19] to msg[26] are "call sign" (tail), space-padded per GDL90 ICD.
+	for i := 19; i < 27; i++ {
+		msg[i] = 0x20
+	}
 	for i := 0; i < len(ti.Tail) && i < 8; i++ {
 		c := byte(ti.Tail[i])
 		if c != 0x20 && !((c >= 48) && (c <= 57)) && !((c >= 65) && (c <= 90)) && c != 'e' && c != 'u' && c != 'a' && c != 'r' && c != 't' { // See p.24, FAA ref.
@@ -687,60 +988,54 @@ func makeTrafficReportMsg(ti TrafficInfo) []byte {
 // Inputs are a checksum-verified hex string corresponding to the 18 or 34-byte UAT
 // message, and an int representing UAT signal amplitude (0-1000).
 func parseDownlinkReport(s string, signalLevel int) {
-
-	var ti TrafficInfo
+	if len(s) <= 1 {
+		return
+	}
 	s = s[1:]
-	frame := make([]byte, len(s)/2)
-	hex.Decode(frame, []byte(s))
+	if len(s)%2 != 0 {
+		return
+	}
+	frameLen := len(s) / 2
+	if frameLen < 18 {
+		return
+	}
+	frame := make([]byte, frameLen)
+	if _, err := hex.Decode(frame, []byte(s)); err != nil {
+		return
+	}
 
 	// Extract header
 	msg_type := (uint8(frame[0]) >> 3) & 0x1f
 	addr_type := uint8(frame[0]) & 0x07
 	icao_addr := (uint32(frame[1]) << 16) | (uint32(frame[2]) << 8) | uint32(frame[3])
 
-	trafficMutex.Lock()
-	defer trafficMutex.Unlock()
+	globalSettingsMutex.RLock()
+	debugEnabled := globalSettings.DEBUG
+	displayTrafficSource := globalSettings.DisplayTrafficSource
+	globalSettingsMutex.RUnlock()
 
-	// Retrieve previous information on this ICAO code.
-	if val, ok := traffic[icao_addr]; ok { // if we've already seen it, copy it in to do updates as it may contain some useful information like "tail" from 1090ES.
-		ti = val
-		//log.Printf("Existing target %X imported for UAT update\n", icao_addr)
-	} else {
-		//log.Printf("New target %X created for UAT update\n", icao_addr)
-		ti.Last_seen = stratuxClock.Time // need to initialize to current stratuxClock so it doesn't get cut before we have a chance to populate a position message
-		ti.Icao_addr = icao_addr
-		ti.ExtrapolatedPosition = false
+	var (
+		uat_version       byte // sent as part of MS element, byte 24
+		hasMS             bool
+		msEmitterCategory uint8
+		hasTail           bool
+		msTail            string
+		hasSquawk         bool
+		msSquawk          int
+		msNACp            int
+		msPriorityStatus  uint8
+	)
 
-		thisReg, validReg := icao2reg(icao_addr)
-		if validReg {
-			ti.Reg = thisReg
-			ti.Tail = thisReg
-		}
-	}
-
-	ti.Addr_type = addr_type
-
-	var uat_version byte // sent as part of MS element, byte 24
-
-	// Extract parameters from Mode Status elements, if available.
-	if msg_type == 1 || msg_type == 3 {
-
-		// Determine UAT message version. This is needed for some capability decoding and is useful for debugging.
+	// Extract parameters from Mode Status elements, if available (requires 34-byte long frame).
+	if (msg_type == 1 || msg_type == 3) && len(frame) >= 34 {
+		hasMS = true
 		uat_version = (frame[23] >> 2) & 0x07
 
-		// Extract emitter category.
 		v := (uint16(frame[17]) << 8) | (uint16(frame[18]))
-		ti.Emitter_category = uint8((v / 1600) % 40)
-
-		// Decode callsign or Flight Plan ID (i.e. squawk code)
-		// If the CSID bit (byte 27, bit 7) is set to 1, all eight characters
-		// encoded in bytes 18-23 represent callsign.
-		// If the CSID bit is set to 0, the first four characters encoded in bytes 18-23
-		// represent the Mode A squawk code.
+		msEmitterCategory = uint8((v / 1600) % 40)
 
 		csid := (frame[26] >> 1) & 0x01
-
-		if csid == 1 { // decode as callsign
+		if csid == 1 {
 			base40_alphabet := string("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ  ..")
 			tail := ""
 
@@ -755,10 +1050,9 @@ func parseDownlinkReport(s string, signalLevel int) {
 			tail += string(base40_alphabet[(v/1600)%40])
 			tail += string(base40_alphabet[(v/40)%40])
 			tail += string(base40_alphabet[v%40])
-			tail = strings.Trim(tail, " ")
-			ti.Tail = tail
-
-		} else if uat_version >= 2 { // decode as Mode 3/A code, if UAT version is at least 2
+			msTail = strings.Trim(tail, " ")
+			hasTail = true
+		} else if uat_version >= 2 {
 			v := (uint16(frame[17]) << 8) | uint16(frame[18])
 			squawk_a := (v / 40) % 40
 			squawk_b := v % 40
@@ -766,64 +1060,34 @@ func parseDownlinkReport(s string, signalLevel int) {
 			squawk_c := (v / 1600) % 40
 			squawk_d := (v / 40) % 40
 			squawk := 1000*squawk_a + 100*squawk_b + 10*squawk_c + squawk_d
-			ti.Squawk = int(squawk)
+			msSquawk = int(squawk)
+			hasSquawk = true
 		}
 
-		ti.NACp = int((frame[25] >> 4) & 0x0F)
-		ti.PriorityStatus = (frame[23] >> 5) & 0x07
+		msNACp = int((frame[25] >> 4) & 0x0F)
+		msPriorityStatus = (frame[23] >> 5) & 0x07
 
-		// Following section is future-use for debugging and / or additional status info on UAT traffic. Message parsing needs testing.
-
-		if globalSettings.DEBUG {
-			//declaration for mode status flags -- parse for debug logging
+		if debugEnabled {
 			var status_sil byte
-			//var status_transmit_mso byte
 			var status_sda byte
 			var status_nacv byte
-			//var status_nicbaro byte
-			//var status_sil_supp byte
-			//var status_geom_vert_acc byte
-			//var status_sa_flag byte
 			var capability_uat_in bool
 			var capability_1090_in bool
-			//var capability_tcas bool
-			//var capability_cdti bool
-			//var opmode_tcas_active bool
-			//var opmode_ident_active bool
-			//var opmode_rec_atc_serv bool
 
-			// these are present in v1 and v2 messages
 			status_sil = frame[23] & 0x03
-			//status_transmit_mso = frame[24] >> 2
 			status_nacv = (frame[25] >> 1) & 0x07
-			//status_nicbaro = frame[25] & 0x01
 
-			// other status and capability bits are different between v1 and v2
 			if uat_version == 2 {
 				status_sda = frame[24] & 0x03
 				capability_uat_in = (frame[26] >> 7) != 0
 				capability_1090_in = ((frame[26] >> 6) & 0x01) != 0
-				//capability_tcas = ((frame[26] >> 5) & 0x01) != 0
-				//opmode_tcas_active = ((frame[26] >> 4) & 0x01) != 0
-				//opmode_ident_active = ((frame[26] >> 3) & 0x01) != 0
-				//opmode_rec_atc_serv = ((frame[26] >> 2) & 0x01) != 0
-				//status_sil_supp = frame[26] & 0x01
-				//status_geom_vert_acc = (frame[27] >> 6) & 0x03
-				//status_sa_flag = (frame[27] >> 5) & 0x01
-
-			} else if uat_version == 1 {
-				//capability_cdti = (frame[26] >> 7) != 0
-				//capability_tcas = ((frame[26] >> 6) & 0x01) != 0
-				//opmode_tcas_active = ((frame[26] >> 5) & 0x01) != 0
-				//opmode_ident_active = ((frame[26] >> 4) & 0x01) != 0
-				//opmode_rec_atc_serv = ((frame[26] >> 3) & 0x01) != 0
 			}
 
 			log.Printf("Supplemental UAT Mode Status for %06X: Version = %d; SIL = %d; SDA = %d; NACv = %d; 978 In = %v; 1090 In = %v\n", icao_addr, uat_version, status_sil, status_sda, status_nacv, capability_uat_in, capability_1090_in)
 		}
 	}
 
-	ti.NIC = int(frame[11] & 0x0F)
+	nic := int(frame[11] & 0x0F)
 
 	var power float64
 	if signalLevel > 0 {
@@ -831,53 +1095,14 @@ func parseDownlinkReport(s string, signalLevel int) {
 	} else {
 		power = -999
 	}
-	//log.Printf("%s (%X) seen with amplitude of %d, corresponding to normalized power of %f.2 dB\n",ti.Tail,ti.Icao_addr,signalLevel,power)
 
-	ti.SignalLevel = power
-
-	if ti.Addr_type == 0 {
-		ti.TargetType = TARGET_TYPE_ADSB
-	} else if ti.Addr_type == 3 {
-		ti.TargetType = TARGET_TYPE_TISB
-	} else if ti.Addr_type == 6 {
-		ti.TargetType = TARGET_TYPE_ADSR
-	} else if ti.Addr_type == 2 {
-		ti.TargetType = TARGET_TYPE_TISB_S
-		if (ti.NIC >= 7) && (ti.Emitter_category > 0) { // If NIC is sufficiently high and emitter type is transmitted, we'll assume it's ADS-R.
-			ti.TargetType = TARGET_TYPE_ADSR
-		}
-	}
-
-	// This is a hack to show the source of the traffic on moving maps.
-	if globalSettings.DisplayTrafficSource {
-		type_code := " "
-		switch ti.TargetType {
-		case TARGET_TYPE_ADSB:
-			type_code = "a"
-		case TARGET_TYPE_ADSR, TARGET_TYPE_TISB_S:
-			type_code = "r"
-		case TARGET_TYPE_TISB:
-			type_code = "t"
-		}
-
-		if len(ti.Tail) == 0 {
-			ti.Tail = "u" + type_code
-		} else if len(ti.Tail) < 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
-			ti.Tail = "u" + type_code + ti.Tail
-		} else if len(ti.Tail) == 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
-			ti.Tail = "u" + type_code + ti.Tail[1:]
-		} else if len(ti.Tail) > 1 { // bounds checking
-			ti.Tail = "u" + type_code + ti.Tail[2:]
-		}
-	}
 	raw_lat := (uint32(frame[4]) << 15) | (uint32(frame[5]) << 7) | (uint32(frame[6]) >> 1)
 	raw_lon := ((uint32(frame[6]) & 0x01) << 23) | (uint32(frame[7]) << 15) | (uint32(frame[8]) << 7) | (uint32(frame[9]) >> 1)
 
 	lat := float32(0.0)
 	lng := float32(0.0)
-
 	position_valid := false
-	if /*(ti.NIC != 0) && */ (raw_lat != 0) && (raw_lon != 0) { // pass all traffic, and let the display determine if it will show NIC == 0. This will allow misconfigured or uncertified / portable emitters to be seen.
+	if (raw_lat != 0) && (raw_lon != 0) {
 		position_valid = true
 		lat = float32(raw_lat) * 360.0 / 16777216.0
 		if lat > 90 {
@@ -885,18 +1110,8 @@ func parseDownlinkReport(s string, signalLevel int) {
 		}
 		lng = float32(raw_lon) * 360.0 / 16777216.0
 		if lng > 180 {
-			lng = lng - 360
+			lng = lng - 180
 		}
-	}
-	ti.Position_valid = position_valid
-	if ti.Position_valid {
-		ti.Lat = lat
-		ti.Lng = lng
-		if isGPSValid() {
-			ti.Distance, ti.Bearing = common.Distance(float64(mySituation.GPSLatitude), float64(mySituation.GPSLongitude), float64(ti.Lat), float64(ti.Lng))
-		}
-		ti.Last_seen = stratuxClock.Time
-		ti.ExtrapolatedPosition = false
 	}
 
 	raw_alt := (int32(frame[10]) << 4) | ((int32(frame[11]) & 0xf0) >> 4)
@@ -906,27 +1121,20 @@ func parseDownlinkReport(s string, signalLevel int) {
 		alt_geo = (uint8(frame[9]) & 1) != 0
 		alt = ((raw_alt - 1) * 25) - 1000
 	}
-	ti.Alt = alt
-	ti.AltIsGNSS = alt_geo
-	ti.Last_alt = stratuxClock.Time
-
-	//OK.
-	//	fmt.Printf("%d, %t, %f, %f, %t, %d\n", nic, position_valid, lat, lng, alt_geo, alt)
 
 	airground_state := (uint8(frame[12]) >> 6) & 0x03
-	//OK.
-	//	fmt.Printf("%d\n", airground_state)
 
-	ns_vel := int32(0) // int16 won't work. Worst case (supersonic), we need 26 bits (25 bits + sign) for root sum of squares speed calculation
+	ns_vel := int32(0)
 	ew_vel := int32(0)
 	track := float32(0)
 	speed_valid := false
 	speed := uint16(0)
 	vvel := int16(0)
-	//	vvel_geo := false
+	hasOnGround := false
+	onGround := false
 	if airground_state == 0 || airground_state == 1 { // Subsonic. Supersonic.
-		ti.OnGround = false
-		// N/S velocity.
+		hasOnGround = true
+		onGround = false
 		ns_vel_valid := false
 		ew_vel_valid := false
 		raw_ns := ((int16(frame[12]) & 0x1f) << 6) | ((int16(frame[13]) & 0xfc) >> 2)
@@ -936,11 +1144,10 @@ func parseDownlinkReport(s string, signalLevel int) {
 			if (raw_ns & 0x400) != 0 {
 				ns_vel = 0 - ns_vel
 			}
-			if airground_state == 1 { // Supersonic.
+			if airground_state == 1 {
 				ns_vel = ns_vel * 4
 			}
 		}
-		// E/W velocity.
 		raw_ew := ((int16(frame[13]) & 0x03) << 9) | (int16(frame[14]) << 1) | ((int16(frame[15] & 0x80)) >> 7)
 		if (raw_ew & 0x3ff) != 0 {
 			ew_vel_valid = true
@@ -948,99 +1155,212 @@ func parseDownlinkReport(s string, signalLevel int) {
 			if (raw_ew & 0x400) != 0 {
 				ew_vel = 0 - ew_vel
 			}
-			if airground_state == 1 { // Supersonic.
+			if airground_state == 1 {
 				ew_vel = ew_vel * 4
 			}
 		}
 		if ns_vel_valid && ew_vel_valid {
 			if ns_vel != 0 || ew_vel != 0 {
-				//TODO: Track type
 				track = float32((360 + 90 - (int16(math.Atan2(float64(ns_vel), float64(ew_vel)) * 180 / math.Pi))) % 360)
 			}
 			speed_valid = true
 			speed = uint16(math.Sqrt(float64((ns_vel * ns_vel) + (ew_vel * ew_vel))))
 		}
 
-		// Vertical velocity.
 		raw_vvel := ((int16(frame[15]) & 0x7f) << 4) | ((int16(frame[16]) & 0xf0) >> 4)
 		if (raw_vvel & 0x1ff) != 0 {
-			//			vvel_geo = (raw_vvel & 0x400) == 0
 			vvel = ((raw_vvel & 0x1ff) - 1) * 64
 			if (raw_vvel & 0x200) != 0 {
 				vvel = 0 - vvel
 			}
 		}
 	} else if airground_state == 2 { // Ground vehicle.
-		ti.OnGround = true
+		hasOnGround = true
+		onGround = true
 		raw_gs := ((uint16(frame[12]) & 0x1f) << 6) | ((uint16(frame[13]) & 0xfc) >> 2)
 		if raw_gs != 0 {
 			speed_valid = true
-			speed = ((raw_gs & 0x3ff) - 1)
+			speed = (raw_gs & 0x3ff) - 1
 		}
-
 		raw_track := ((uint16(frame[13]) & 0x03) << 9) | (uint16(frame[14]) << 1) | ((uint16(frame[15]) & 0x80) >> 7)
-		//tt := ((raw_track & 0x0600) >> 9)
-		//FIXME: tt == 1 TT_TRACK. tt == 2 TT_MAG_HEADING. tt == 3 TT_TRUE_HEADING.
 		track = float32((raw_track & 0x1ff) * 360 / 512)
-
-		// Dimensions of vehicle - skip.
 	}
 
-	if msg_type == 1 || msg_type == 2 || msg_type == 5 || msg_type == 6 {
-		// Read AUXSV.
-		raw_alt := (int32(frame[29]) << 4) | ((int32(frame[30]) & 0xf0) >> 4)
-		if raw_alt != 0 {
-			alt := ((raw_alt - 1) * 25) - 1000
-			if ti.AltIsGNSS {
-				// Current ti.Alt is GNSS. Swap it for the AUXSV alt, which is baro.
-				baro_alt := ti.Alt
-				ti.Alt = alt
-				alt = baro_alt
-				ti.AltIsGNSS = false
+	var ti TrafficInfo
+
+	func() {
+		trafficMutex.Lock()
+		defer trafficMutex.Unlock()
+
+		nowMono := stratuxClock.GetTime()
+
+		// Resolve canonical key via traffic fusion (exact ICAO, DDB alias, or 3D spatial/velocity correlation).
+		key, matchedExisting := globalTrafficFusion.ResolveCanonicalKeyWithContext(
+			icao_addr, 0, TRAFFIC_SOURCE_UAT,
+			lat, lng, alt, track, speed, speed_valid, position_valid, nowMono, traffic,
+		)
+		if matchedExisting {
+			ti = traffic[key]
+		} else {
+			ti.Last_seen = nowMono // need to initialize to current stratuxClock so it doesn't get cut before we have a chance to populate a position message
+			ti.Icao_addr = icao_addr
+			ti.ExtrapolatedPosition = false
+
+			thisReg, validReg := icao2reg(icao_addr)
+			if validReg {
+				ti.Reg = thisReg
+				ti.Tail = thisReg
+			}
+		}
+
+		effEmitterCat := ti.Emitter_category
+		if hasMS {
+			effEmitterCat = msEmitterCategory
+		}
+		incomingTargetType := ti.TargetType
+		if addr_type == 0 {
+			incomingTargetType = TARGET_TYPE_ADSB
+		} else if addr_type == 3 {
+			incomingTargetType = TARGET_TYPE_TISB
+		} else if addr_type == 6 {
+			incomingTargetType = TARGET_TYPE_ADSR
+		} else if addr_type == 2 {
+			incomingTargetType = TARGET_TYPE_TISB_S
+			if (nic >= 7) && (effEmitterCat > 0) { // If NIC is sufficiently high and emitter type is transmitted, we'll assume it's ADS-R.
+				incomingTargetType = TARGET_TYPE_ADSR
+			}
+		}
+
+		acceptPos := !matchedExisting || ShouldAcceptPositionUpdate(ti, TRAFFIC_SOURCE_UAT, incomingTargetType, false, nowMono)
+
+		if hasMS {
+			if msEmitterCategory > 0 || ti.Emitter_category == 0 {
+				ti.Emitter_category = msEmitterCategory
+			}
+			if hasTail && (acceptPos || len(ti.Tail) == 0) {
+				ti.Tail = msTail
+			}
+			if hasSquawk {
+				ti.Squawk = msSquawk
+			}
+			if acceptPos || ti.NACp == 0 {
+				ti.NACp = msNACp
+			}
+			if acceptPos || msPriorityStatus > 0 {
+				ti.PriorityStatus = msPriorityStatus
+			}
+		}
+
+		if acceptPos {
+			ti.Addr_type = addr_type
+			ti.NIC = nic
+			ti.SignalLevel = power
+			ti.TargetType = incomingTargetType
+
+			// This is a hack to show the source of the traffic on moving maps.
+			if displayTrafficSource {
+				type_code := " "
+				switch ti.TargetType {
+				case TARGET_TYPE_ADSB:
+					type_code = "a"
+				case TARGET_TYPE_ADSR, TARGET_TYPE_TISB_S:
+					type_code = "r"
+				case TARGET_TYPE_TISB:
+					type_code = "t"
+				}
+
+				if len(ti.Tail) == 0 {
+					ti.Tail = "u" + type_code
+				} else if len(ti.Tail) < 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
+					ti.Tail = "u" + type_code + ti.Tail
+				} else if len(ti.Tail) == 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
+					ti.Tail = "u" + type_code + ti.Tail[1:]
+				} else if len(ti.Tail) > 1 { // bounds checking
+					ti.Tail = "u" + type_code + ti.Tail[2:]
+				}
+			}
+		}
+
+		if acceptPos {
+			ti.Position_valid = position_valid
+			if ti.Position_valid {
+				ti.Lat = lat
+				ti.Lng = lng
+				if isGPSValid() {
+					mySituation.muGPS.Lock()
+					ownLat := mySituation.GPSLatitude
+					ownLng := mySituation.GPSLongitude
+					mySituation.muGPS.Unlock()
+					ti.Distance, ti.Bearing = common.Distance(float64(ownLat), float64(ownLng), float64(ti.Lat), float64(ti.Lng))
+					ti.BearingDist_valid = true
+				}
+				ti.Last_seen = nowMono
+				ti.Age = 0
+				ti.ExtrapolatedPosition = false
 			}
 
-			ti.GnssDiffFromBaroAlt = alt - ti.Alt
-			ti.Last_GnssDiff = stratuxClock.Time
-			ti.Last_GnssDiffAlt = ti.Alt
+			if hasOnGround {
+				ti.OnGround = onGround
+			}
+			ti.Track = track
+			ti.Speed = speed
+			ti.Vvel = vvel
+			ti.Speed_valid = speed_valid
+			if ti.Speed_valid {
+				ti.Last_speed = nowMono
+			}
 
+			ti.Timestamp = time.Now()
+			ti.Last_source = TRAFFIC_SOURCE_UAT
 		}
-	}
 
-	ti.Track = track
-	ti.Speed = speed
-	ti.Vvel = vvel
-	ti.Speed_valid = speed_valid
-	if ti.Speed_valid {
-		ti.Last_speed = stratuxClock.Time
-	}
-
-	//	fmt.Printf("ns_vel %d, ew_vel %d, track %d, speed_valid %t, speed %d, vvel_geo %t, vvel %d\n", ns_vel, ew_vel, track, speed_valid, speed, vvel_geo, vvel)
-
-	/*
-		utc_coupled := false
-		tisb_site_id := uint8(0)
-
-		if (uint8(frame[0]) & 7) == 2 || (uint8(frame[0]) & 7) == 3 { //TODO: Meaning?
-			tisb_site_id = uint8(frame[16]) & 0x0f
-		} else {
-			utc_coupled = (uint8(frame[16]) & 0x08) != 0
+		if raw_alt != 0 {
+			MergeAltitude(&ti, alt, alt_geo, TRAFFIC_SOURCE_UAT, nowMono)
+		} else if !matchedExisting {
+			ti.Alt = 0
+			ti.AltIsGNSS = false
+			ti.Last_alt = nowMono
 		}
-	*/
 
-	//	fmt.Printf("tisb_site_id %d, utc_coupled %t\n", tisb_site_id, utc_coupled)
+		if (msg_type == 1 || msg_type == 2 || msg_type == 5 || msg_type == 6) && len(frame) >= 34 {
+			// Read AUXSV (only compute GnssDiffFromBaroAlt when primary raw_alt != 0).
+			raw_aux_alt := (int32(frame[29]) << 4) | ((int32(frame[30]) & 0xf0) >> 4)
+			if raw_aux_alt != 0 && raw_alt != 0 {
+				aux_alt := ((raw_aux_alt - 1) * 25) - 1000
+				if ti.AltIsGNSS {
+					// Current ti.Alt is GNSS. Swap it for the AUXSV alt, which is baro.
+					gnss_alt := ti.Alt
+					ti.Alt = aux_alt
+					aux_alt = gnss_alt
+					ti.AltIsGNSS = false
+				}
 
-	ti.Timestamp = time.Now()
+				ti.GnssDiffFromBaroAlt = aux_alt - ti.Alt
+				ti.Last_GnssDiff = nowMono
+				ti.Last_GnssDiffAlt = ti.Alt
+			}
+		}
 
-	ti.Last_source = TRAFFIC_SOURCE_UAT
-	postProcessTraffic(&ti)
-	traffic[ti.Icao_addr] = ti
+		addFusedSource(&ti, "978UAT")
+		ti.SourceConfidence = TrafficSourcePriority(int(ti.Last_source), ti.TargetType, ti.ExtrapolatedPosition)
+
+		postProcessTraffic(&ti)
+		traffic[key] = ti
+		markTrafficSeen(key)
+	}()
+
 	registerTrafficUpdate(ti)
-	seenTraffic[ti.Icao_addr] = true // Mark as seen.
+}
+
+func isESInputEnabled() bool {
+	globalSettingsMutex.RLock()
+	defer globalSettingsMutex.RUnlock()
+	return globalSettings.ES_Enabled || globalSettings.Ping_Enabled || globalSettings.Pong_Enabled
 }
 
 func esListen() {
 	for {
-		if !globalSettings.ES_Enabled && !globalSettings.Ping_Enabled && !globalSettings.Pong_Enabled {
+		if !isESInputEnabled() {
 			time.Sleep(1 * time.Second) // Don't do much unless ES is actually enabled.
 			continue
 		}
@@ -1052,7 +1372,7 @@ func esListen() {
 			continue
 		}
 		rdr := bufio.NewReader(inConn)
-		for globalSettings.ES_Enabled || globalSettings.Ping_Enabled {
+		for isESInputEnabled() {
 			buf, err := rdr.ReadString('\n')
 			if err != nil { // Must have disconnected?
 				break
@@ -1061,43 +1381,51 @@ func esListen() {
 			TraceLog.Record(CONTEXT_DUMP1090, []byte(buf))
 			parseDump1090Message(buf)
 		}
-		for globalSettings.ES_Enabled || globalSettings.Pong_Enabled {
-			buf, err := rdr.ReadString('\n')
-			if err != nil { // Must have disconnected?
-				break
-			}
-			buf = strings.Trim(buf, "\r\n")
-			TraceLog.Record(CONTEXT_DUMP1090, []byte(buf))
-			parseDump1090Message(buf)
-		}
+		_ = inConn.Close()
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
 func parseDump1090Message(buf string) {
+	nowMono := stratuxClock.GetTime()
 	// Log the message to the message counter in any case.
 	var thisMsg msg
 	thisMsg.MessageClass = MSGCLASS_ES
-	thisMsg.TimeReceived = stratuxClock.Time
+	thisMsg.TimeReceived = nowMono
 	thisMsg.Data = buf
 	msgLogAppend(thisMsg)
 
 	var eslog esmsg
-	eslog.TimeReceived = stratuxClock.Time
+	eslog.TimeReceived = nowMono
 	eslog.Data = buf
 	logESMsg(eslog) // log raw dump1090:30006 output to SQLite log
+
+	globalSettingsMutex.RLock()
+	pingEnabled := globalSettings.Ping_Enabled
+	pongEnabled := globalSettings.Pong_Enabled
+	debugEnabled := globalSettings.DEBUG
+	displayTrafficSource := globalSettings.DisplayTrafficSource
+	globalSettingsMutex.RUnlock()
+
 	// Only increment if using an SDR for 1090 traffic
-	if !globalSettings.Ping_Enabled  && !globalSettings.Pong_Enabled {
+	if !pingEnabled && !pongEnabled {
+		globalStatusMutex.Lock()
 		globalStatus.ES_messages_total++
+		globalStatusMutex.Unlock()
 	}
-	var newTi *dump1090Data
-	err := json.Unmarshal([]byte(buf), &newTi)
+	trimmed := strings.TrimSpace(buf)
+	if len(trimmed) == 0 || trimmed == "null" {
+		return
+	}
+	var newTi dump1090Data
+	err := json.Unmarshal([]byte(trimmed), &newTi)
 	if err != nil {
 		log.Printf("can't read ES traffic information from %s: %s\n", buf, err.Error())
 		return
 	}
 
 	if newTi.Icao_addr == 0x07FFFFFF { // used to signal heartbeat
-		if globalSettings.DEBUG {
+		if debugEnabled {
 			log.Printf("No traffic last 60 seconds. Heartbeat message from dump1090: %s\n", buf)
 		}
 		return // don't process heartbeat messages
@@ -1105,293 +1433,265 @@ func parseDump1090Message(buf string) {
 
 	if (newTi.Icao_addr & 0x01000000) != 0 { // bit 25 used by dump1090 to signal non-ICAO address
 		newTi.Icao_addr = newTi.Icao_addr & 0x00FFFFFF
-		if globalSettings.DEBUG {
+		if debugEnabled {
 			log.Printf("Non-ICAO address %X sent by dump1090. This is typical for TIS-B.\n", newTi.Icao_addr)
 		}
 	}
 	icao := uint32(newTi.Icao_addr)
-	var ti TrafficInfo
 
-	trafficMutex.Lock()
-
-	// Retrieve previous information on this ICAO code.
-	if val, ok := traffic[icao]; ok { // if we've already seen it, copy it in to do updates
-		ti = val
-		//log.Printf("Existing target %X imported for ES update\n", icao)
-	} else {
-		//log.Printf("New target %X created for ES update\n",newTi.Icao_addr)
-		ti.Last_seen = stratuxClock.Time // need to initialize to current stratuxClock so it doesn't get cut before we have a chance to populate a position message
-		ti.Last_alt = stratuxClock.Time  // ditto.
-		ti.Icao_addr = icao
-		ti.ExtrapolatedPosition = false
-		ti.Last_source = TRAFFIC_SOURCE_1090ES
-
-		thisReg, validReg := icao2reg(icao)
-		if validReg {
-			ti.Reg = thisReg
-			ti.Tail = thisReg
-		}
-	}
-
-	if newTi.SignalLevel > 0 {
-		power := 10 * math.Log10(newTi.SignalLevel)
-		ti.SignalLevelHist = append(ti.SignalLevelHist, power)
-		if len(ti.SignalLevelHist) > 8 {
-			ti.SignalLevelHist = ti.SignalLevelHist[len(ti.SignalLevelHist)-8:]
-		}
-		ti.SignalLevel = -999
-		for _, level := range(ti.SignalLevelHist) {
-			if level > ti.SignalLevel {
-				ti.SignalLevel = level
-			}
-		}
-	} else {
-		ti.SignalLevel = -999
-	}
-
-	// generate human readable summary of message types for debug
-	//TODO: Use for ES message statistics?
-	/*
-		var s1 string
-		if newTi.DF == 17 {
-			s1 = "ADS-B"
-		}
-		if newTi.DF == 18 {
-			s1 = "ADS-R / TIS-B"
-		}
-
-		if newTi.DF == 4 || newTi.DF == 20 {
-			s1 = "Surveillance, Alt. Reply"
-		}
-
-		if newTi.DF == 5 || newTi.DF == 21 {
-			s1 = "Surveillance, Ident. Reply"
-		}
-
-		if newTi.DF == 11 {
-			s1 = "All-call Reply"
-		}
-
-		if newTi.DF == 0 {
-			s1 = "Short Air-Air Surv."
-		}
-
-		if newTi.DF == 16 {
-			s1 = "Long Air-Air Surv."
-		}
-	*/
-	//log.Printf("Mode S message from icao=%X, DF=%02d, CA=%02d, TC=%02d (%s)\n", ti.Icao_addr, newTi.DF, newTi.CA, newTi.TypeCode, s1)
-
-	// Altitude will be sent by dump1090 for ES ADS-B/TIS-B (DF=17 and DF=18)
-	// and Mode S messages (DF=0, DF = 4, and DF = 20).
-
-	ti.AltIsGNSS = newTi.AltIsGNSS
-
-	if newTi.Alt != nil {
-		ti.Alt = int32(*newTi.Alt)
-		ti.Last_alt = stratuxClock.Time
-	}
-
-	if newTi.GnssDiffFromBaroAlt != nil {
-		ti.GnssDiffFromBaroAlt = int32(*newTi.GnssDiffFromBaroAlt) // we can estimate pressure altitude from GNSS height with this parameter!
-		ti.Last_GnssDiff = stratuxClock.Time
-		ti.Last_GnssDiffAlt = ti.Alt
-	}
-
-	// Position updates are provided only by ES messages (DF=17 and DF=18; multiple TCs)
-	if newTi.Position_valid { // i.e. DF17 or DF18 message decoded successfully by dump1090
-		valid_position := true
-		var lat, lng float32
-
-		if newTi.Lat != nil {
-			lat = float32(*newTi.Lat)
-		} else { // dump1090 send a valid message, but Stratux couldn't figure it out for some reason.
-			valid_position = false
-			//log.Printf("Missing latitude in DF=17/18 airborne position message\n")
-		}
-
-		if newTi.Lng != nil {
-			lng = float32(*newTi.Lng)
-		} else { //
-			valid_position = false
-			//log.Printf("Missing longitude in DF=17 airborne position message\n")
-		}
-
-		if valid_position {
-			ti.Lat = lat
-			ti.Lng = lng
-			if isGPSValid() {
-				ti.Distance, ti.Bearing = common.Distance(float64(mySituation.GPSLatitude), float64(mySituation.GPSLongitude), float64(ti.Lat), float64(ti.Lng))
-				ti.BearingDist_valid = true
-			}
-			ti.Position_valid = true
-			ti.ExtrapolatedPosition = false
-			ti.Last_seen = stratuxClock.Time // only update "last seen" data on position updates
-		}
-	} else {
-		// Old traffic had no position and update doesn't have a position either -> assume Mode-S only
-		if !ti.Position_valid {
-			ti.Last_seen = ti.Last_alt
-		}
-	}
-
-	if newTi.Speed_valid { // i.e. DF17 or DF18, TC 19 message decoded successfully by dump1090
-		valid_speed := true
-		var speed uint16
-		var track float32
-
-		if newTi.Track != nil {
-			track = float32(*newTi.Track)
-		} else { // dump1090 send a valid message, but Stratux couldn't figure it out for some reason.
-			valid_speed = false
-			//log.Printf("Missing track in DF=17/18 TC19 airborne velocity message\n")
-		}
-
-		if newTi.Speed != nil {
-			speed = uint16(*newTi.Speed)
-		} else { //
-			valid_speed = false
-			//log.Printf("Missing speed in DF=17/18 TC19 airborne velocity message\n")
-		}
-
-		if newTi.Vvel != nil {
-			ti.Vvel = int16(*newTi.Vvel)
-		} else { // we'll still make the message without a valid vertical speed.
-			//log.Printf("Missing vertical speed in DF=17/18 TC19 airborne velocity message\n")
-		}
-
-		if valid_speed {
-			ti.Track = track
-			ti.Speed = speed
-			ti.Speed_valid = true
-			ti.Last_speed = stratuxClock.Time // only update "last seen" data on position updates
-		}
-	} else if ((newTi.DF == 17) || (newTi.DF == 18)) && (newTi.TypeCode == 19) { // invalid speed on velocity message only
-		ti.Speed_valid = false
-	}
-
-	// Determine NIC (navigation integrity category) from type code and subtype code
-	if ((newTi.DF == 17) || (newTi.DF == 18)) && (newTi.TypeCode >= 5 && newTi.TypeCode <= 22) && (newTi.TypeCode != 19) {
-		nic := 0 // default for unknown or missing NIC
-		switch newTi.TypeCode {
-		case 0, 8, 18, 22:
-			nic = 0
-		case 17:
-			nic = 1
-		case 16:
-			if newTi.SubtypeCode == 1 {
-				nic = 3
-			} else {
-				nic = 2
-			}
-		case 15:
-			nic = 4
-		case 14:
-			nic = 5
-		case 13:
-			nic = 6
-		case 12:
-			nic = 7
-		case 11:
-			if newTi.SubtypeCode == 1 {
-				nic = 9
-			} else {
-				nic = 8
-			}
-		case 10, 21:
-			nic = 10
-		case 9, 20:
-			nic = 11
-		}
-		ti.NIC = nic
-
-		if (ti.NACp < 7) && (ti.NACp < ti.NIC) {
-			ti.NACp = ti.NIC // initialize to NIC, since NIC is sent with every position report, and not all emitters report NACp.
-		}
-	}
-
-	if newTi.NACp != nil {
-		ti.NACp = *newTi.NACp
-	}
-
-	if newTi.Emitter_category != nil {
-		ti.Emitter_category = uint8(*newTi.Emitter_category) // validate dump1090 on live traffic
-	}
-
-	if newTi.Squawk != nil {
-		ti.Squawk = int(*newTi.Squawk) // only provided by Mode S messages, so we don't do this in parseUAT.
-	}
-	// Set the target type. DF=18 messages are sent by ground station, so we look at CA
-	// (repurposed to Control Field in DF18) to determine if it's ADS-R or TIS-B.
+	var (
+		incomingTargetType uint8
+		incomingAddrType   uint8
+		hasTargetType      bool
+	)
 	if newTi.DF == 17 {
-		ti.TargetType = TARGET_TYPE_ADSB
-		ti.Addr_type = 0
+		incomingTargetType = TARGET_TYPE_ADSB
+		incomingAddrType = 0
+		hasTargetType = true
 	} else if newTi.DF == 18 {
 		if newTi.CA == 6 {
-			ti.TargetType = TARGET_TYPE_ADSR
-			ti.Addr_type = 2
+			incomingTargetType = TARGET_TYPE_ADSR
+			incomingAddrType = 2
+			hasTargetType = true
 		} else if newTi.CA == 2 { // 2 = TIS-B with ICAO address, 5 = TIS-B without ICAO address
-			ti.TargetType = TARGET_TYPE_TISB
-			ti.Addr_type = 2
+			incomingTargetType = TARGET_TYPE_TISB
+			incomingAddrType = 2
+			hasTargetType = true
 		} else if newTi.CA == 5 {
-			ti.TargetType = TARGET_TYPE_TISB
-			ti.Addr_type = 3
+			incomingTargetType = TARGET_TYPE_TISB
+			incomingAddrType = 3
+			hasTargetType = true
 		}
 	}
 
-	if newTi.OnGround != nil { // DF=11 messages don't report "on ground" status so we need to check for valid values.
-		ti.OnGround = bool(*newTi.OnGround)
+	var inLat, inLng float32
+	inPosValid := newTi.Position_valid && newTi.Lat != nil && newTi.Lng != nil
+	if inPosValid {
+		inLat = float32(*newTi.Lat)
+		inLng = float32(*newTi.Lng)
+	}
+	var inAlt int32
+	if newTi.Alt != nil {
+		inAlt = int32(*newTi.Alt)
+	}
+	var inTrack float32
+	var inSpeed uint16
+	inSpeedValid := newTi.Speed_valid && newTi.Track != nil && newTi.Speed != nil
+	if inSpeedValid {
+		inTrack = float32(*newTi.Track)
+		inSpeed = uint16(*newTi.Speed)
 	}
 
-	if (newTi.Tail != nil) && ((newTi.DF == 17) || (newTi.DF == 18) || (newTi.DF == 20) || (newTi.DF == 21)) { // DF=17 or DF=18, Type Code 1-4 , DF=20 Altitude Reply (often with Ident in Comm-B) DF=21 Identity Reply
-		ti.Tail = *newTi.Tail
-		ti.Tail = strings.Trim(ti.Tail, " ") // remove extraneous spaces
-	}
+	var ti TrafficInfo
 
-	// This is a hack to show the source of the traffic on moving maps.
+	func() {
+		trafficMutex.Lock()
+		defer trafficMutex.Unlock()
 
-	if globalSettings.DisplayTrafficSource {
-		type_code := " "
-		switch ti.TargetType {
-		case TARGET_TYPE_ADSB:
-			type_code = "a"
-		case TARGET_TYPE_ADSR:
-			type_code = "r"
-		case TARGET_TYPE_TISB:
-			type_code = "t"
-		}
+		updateNow := stratuxClock.GetTime()
 
-		if len(ti.Tail) == 0 {
-			ti.Tail = "e" + type_code
-		} else if len(ti.Tail) < 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
-			ti.Tail = "e" + type_code + ti.Tail
-		} else if len(ti.Tail) == 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
-			ti.Tail = "e" + type_code + ti.Tail[1:]
-		} else if len(ti.Tail) > 1 { // bounds checking
-			ti.Tail = "e" + type_code + ti.Tail[2:]
-
-		}
-	}
-
-	if newTi.DF == 17 || newTi.DF == 18 {
-		ti.Last_source = TRAFFIC_SOURCE_1090ES // only update traffic source on ADS-B messages. Prevents source on UAT ADS-B targets with Mode S transponders from "flickering" every time we get an altitude or DF11 update.
-	}
-	ti.Timestamp = newTi.Timestamp // only update "last seen" data on position updates
-
-	/*
-		s_out, err := json.Marshal(ti)
-		if err != nil {
-			log.Printf("Error generating output: %s\n", err.Error())
+		// Resolve canonical key via traffic fusion (exact ICAO, DDB alias, or 3D spatial/velocity correlation).
+		key, matchedExisting := globalTrafficFusion.ResolveCanonicalKeyWithContext(
+			icao, 0, TRAFFIC_SOURCE_1090ES,
+			inLat, inLng, inAlt, inTrack, inSpeed, inSpeedValid, inPosValid, updateNow, traffic,
+		)
+		if matchedExisting {
+			ti = traffic[key]
 		} else {
-			log.Printf("%X (DF%d) => %s\n", ti.Icao_addr, newTi.DF, string(s_out))
+			ti.Last_seen = updateNow // need to initialize to current stratuxClock so it doesn't get cut before we have a chance to populate a position message
+			ti.Last_alt = updateNow  // ditto.
+			ti.Icao_addr = icao
+			ti.ExtrapolatedPosition = false
+			ti.Last_source = TRAFFIC_SOURCE_1090ES
+
+			thisReg, validReg := icao2reg(icao)
+			if validReg {
+				ti.Reg = thisReg
+				ti.Tail = thisReg
+			}
 		}
-	*/
-	postProcessTraffic(&ti)
-	traffic[ti.Icao_addr] = ti // Update information on this ICAO code.
+
+		effTargetType := ti.TargetType
+		if hasTargetType {
+			effTargetType = incomingTargetType
+		}
+		acceptPos := !matchedExisting || ShouldAcceptPositionUpdate(ti, TRAFFIC_SOURCE_1090ES, effTargetType, false, updateNow)
+
+		if newTi.SignalLevel > 0 {
+			power := 10 * math.Log10(newTi.SignalLevel)
+			ti.SignalLevelHist = append(ti.SignalLevelHist, power)
+			if len(ti.SignalLevelHist) > 8 {
+				ti.SignalLevelHist = ti.SignalLevelHist[len(ti.SignalLevelHist)-8:]
+			}
+			ti.SignalLevel = -999
+			for _, level := range ti.SignalLevelHist {
+				if level > ti.SignalLevel {
+					ti.SignalLevel = level
+				}
+			}
+		} else {
+			ti.SignalLevel = -999
+		}
+
+		// Altitude will be sent by dump1090 for ES ADS-B/TIS-B (DF=17 and DF=18)
+		// and Mode S messages (DF=0, DF = 4, and DF = 20).
+		if newTi.Alt != nil {
+			MergeAltitude(&ti, int32(*newTi.Alt), newTi.AltIsGNSS, TRAFFIC_SOURCE_1090ES, updateNow)
+		}
+
+		if newTi.GnssDiffFromBaroAlt != nil {
+			ti.GnssDiffFromBaroAlt = int32(*newTi.GnssDiffFromBaroAlt) // we can estimate pressure altitude from GNSS height with this parameter!
+			ti.Last_GnssDiff = updateNow
+			ti.Last_GnssDiffAlt = ti.Alt
+		}
+
+		// Position updates are provided only by ES messages (DF=17 and DF=18; multiple TCs)
+		if newTi.Position_valid { // i.e. DF17 or DF18 message decoded successfully by dump1090
+			if inPosValid && acceptPos {
+				ti.Lat = inLat
+				ti.Lng = inLng
+				if isGPSValid() {
+					mySituation.muGPS.Lock()
+					ownLat := mySituation.GPSLatitude
+					ownLng := mySituation.GPSLongitude
+					mySituation.muGPS.Unlock()
+					ti.Distance, ti.Bearing = common.Distance(float64(ownLat), float64(ownLng), float64(ti.Lat), float64(ti.Lng))
+					ti.BearingDist_valid = true
+				}
+				ti.Position_valid = true
+				ti.ExtrapolatedPosition = false
+				ti.Last_seen = updateNow // only update "last seen" data on position updates
+				ti.Age = 0
+			}
+		} else {
+			// Old traffic had no position and update doesn't have a position either -> assume Mode-S only
+			if !ti.Position_valid {
+				ti.Last_seen = ti.Last_alt
+			}
+		}
+
+		if newTi.Speed_valid { // i.e. DF17 or DF18, TC 19 message decoded successfully by dump1090
+			if acceptPos {
+				if newTi.Vvel != nil {
+					ti.Vvel = int16(*newTi.Vvel)
+				}
+				if inSpeedValid {
+					ti.Track = inTrack
+					ti.Speed = inSpeed
+					ti.Speed_valid = true
+					ti.Last_speed = updateNow
+				}
+			}
+		} else if ((newTi.DF == 17) || (newTi.DF == 18)) && (newTi.TypeCode == 19) && acceptPos { // invalid speed on velocity message only
+			ti.Speed_valid = false
+		}
+
+		// Determine NIC (navigation integrity category) from type code and subtype code
+		if ((newTi.DF == 17) || (newTi.DF == 18)) && (newTi.TypeCode >= 5 && newTi.TypeCode <= 22) && (newTi.TypeCode != 19) {
+			nic := 0 // default for unknown or missing NIC
+			switch newTi.TypeCode {
+			case 0, 8, 18, 22:
+				nic = 0
+			case 17:
+				nic = 1
+			case 16:
+				if newTi.SubtypeCode == 1 {
+					nic = 3
+				} else {
+					nic = 2
+				}
+			case 15:
+				nic = 4
+			case 14:
+				nic = 5
+			case 13:
+				nic = 6
+			case 12:
+				nic = 7
+			case 11:
+				if newTi.SubtypeCode == 1 {
+					nic = 9
+				} else {
+					nic = 8
+				}
+			case 10, 21:
+				nic = 10
+			case 9, 20:
+				nic = 11
+			}
+			ti.NIC = nic
+
+			if (ti.NACp < 7) && (ti.NACp < ti.NIC) {
+				ti.NACp = ti.NIC // initialize to NIC, since NIC is sent with every position report, and not all emitters report NACp.
+			}
+		}
+
+		if newTi.NACp != nil {
+			ti.NACp = *newTi.NACp
+		}
+
+		if newTi.Emitter_category != nil {
+			ti.Emitter_category = uint8(*newTi.Emitter_category) // validate dump1090 on live traffic
+		}
+
+		if newTi.Squawk != nil {
+			ti.Squawk = int(*newTi.Squawk) // only provided by Mode S messages, so we don't do this in parseUAT.
+		}
+		// Set the target type. DF=18 messages are sent by ground station, so we look at CA
+		// (repurposed to Control Field in DF18) to determine if it's ADS-R or TIS-B.
+		if hasTargetType && acceptPos {
+			ti.TargetType = incomingTargetType
+			ti.Addr_type = incomingAddrType
+		}
+
+		if newTi.OnGround != nil && acceptPos { // DF=11 messages don't report "on ground" status so we need to check for valid values.
+			ti.OnGround = bool(*newTi.OnGround)
+		}
+
+		if (newTi.Tail != nil) && ((newTi.DF == 17) || (newTi.DF == 18) || (newTi.DF == 20) || (newTi.DF == 21)) { // DF=17 or DF=18, Type Code 1-4 , DF=20 Altitude Reply (often with Ident in Comm-B) DF=21 Identity Reply
+			ti.Tail = *newTi.Tail
+			ti.Tail = strings.Trim(ti.Tail, " ") // remove extraneous spaces
+		}
+
+		// This is a hack to show the source of the traffic on moving maps.
+		if displayTrafficSource && acceptPos {
+			type_code := " "
+			switch ti.TargetType {
+			case TARGET_TYPE_ADSB:
+				type_code = "a"
+			case TARGET_TYPE_ADSR:
+				type_code = "r"
+			case TARGET_TYPE_TISB:
+				type_code = "t"
+			}
+
+			if len(ti.Tail) == 0 {
+				ti.Tail = "e" + type_code
+			} else if len(ti.Tail) < 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
+				ti.Tail = "e" + type_code + ti.Tail
+			} else if len(ti.Tail) == 7 && ti.Tail[0] != 'e' && ti.Tail[0] != 'u' {
+				ti.Tail = "e" + type_code + ti.Tail[1:]
+			} else if len(ti.Tail) > 1 { // bounds checking
+				ti.Tail = "e" + type_code + ti.Tail[2:]
+			}
+		}
+
+		if (newTi.DF == 17 || newTi.DF == 18) && acceptPos {
+			ti.Last_source = TRAFFIC_SOURCE_1090ES // only update traffic source on ADS-B messages. Prevents source on UAT ADS-B targets with Mode S transponders from "flickering" every time we get an altitude or DF11 update.
+		}
+		if acceptPos {
+			ti.Timestamp = newTi.Timestamp // only update "last seen" data on position updates
+		}
+
+		addFusedSource(&ti, "1090ES")
+		ti.SourceConfidence = TrafficSourcePriority(int(ti.Last_source), ti.TargetType, ti.ExtrapolatedPosition)
+
+		postProcessTraffic(&ti)
+		traffic[key] = ti // Update information on this canonical target key.
+		markTrafficSeen(key)
+	}()
+
 	registerTrafficUpdate(ti)
-	seenTraffic[ti.Icao_addr] = true // Mark as seen.
-	//log.Printf("%v\n",traffic)
-	trafficMutex.Unlock()
 }
 
 func trafficInfoExtrapolator() {
@@ -1399,16 +1699,15 @@ func trafficInfoExtrapolator() {
 		time.Sleep(1 * time.Second)
 		trafficMutex.Lock()
 		for key, ti := range traffic {
-			if ti.Age < 2 || !ti.Position_valid || !ti.Speed_valid {
+			age := stratuxClock.Since(ti.Last_seen).Seconds()
+			if age < 2 || !ti.Position_valid || !ti.Speed_valid {
 				continue
 			}
 			extrapolateTraffic(&ti)
-			//log.Printf("Extrapolating " + ti.Tail + " oldPos: %f,%f,%d, newPos: %f,%f,%d", ti.Lat_fix, ti.Lng_fix, ti.Alt_fix, ti.Lat, ti.Lng, ti.Alt)
 			traffic[key] = ti
 		}
 		trafficMutex.Unlock()
 	}
-
 }
 
 func extrapolateTraffic(ti *TrafficInfo) {
@@ -1420,6 +1719,9 @@ func extrapolateTraffic(ti *TrafficInfo) {
 	}
 
 	seconds := stratuxClock.Since(ti.Last_extrapolation).Seconds()
+	if seconds <= 0 {
+		return
+	}
 	travelDist := float64(ti.Speed) * (seconds / 60 / 60) // speed is knots=nm per hour. /60/60 = nm per second
 
 	// Estimate alt
@@ -1428,22 +1730,11 @@ func extrapolateTraffic(ti *TrafficInfo) {
 	lat, lng := calcLocationForBearingDistance(float64(ti.Lat), float64(ti.Lng), float64(ti.Track), travelDist)
 	ti.Lat = float32(lat)
 	ti.Lng = float32(lng)
-	// Estimate track
-	ti.Track += float32(seconds) * ti.TurnRate
-	for ti.Track < 0 {
-		ti.Track += 360
-	}
-	for ti.Track > 360 {
-		ti.Track -= 360
-	}
-	// ti.Track = ti.Track % 360
+	// Estimate track (O(1) wrap, guards NaN/Inf)
+	ti.Track = float32(normalizeAngle360(float64(ti.Track) + seconds*float64(ti.TurnRate)))
 
 	ti.ExtrapolatedPosition = true
-	ti.Last_extrapolation = stratuxClock.Time
-	
-	// TODO: should we call registerTrafficUpdate() to send this traffic to the web interface?
-	// Pro: web interface also shows interpolated position
-	// Con: it doesn't show the really received position with the age any more (i.e. age gets older but position updates)
+	ti.Last_extrapolation = stratuxClock.GetTime()
 }
 
 /*
@@ -1461,95 +1752,106 @@ and speed invalid flag is set for headings 135-150 to allow testing of response 
 */
 func updateDemoTraffic(icao uint32, tail string, relAlt float32, gs float64, offset int32) {
 	var ti TrafficInfo
-	trafficMutex.Lock()
-	defer trafficMutex.Unlock()
+	var shouldBroadcast bool
 
-	// Retrieve previous information on this ICAO code.
-	if val, ok := traffic[icao]; ok { // if we've already seen it, copy it in to do updates
-		ti = val
-		//log.Printf("Existing target %X imported for ES update\n", icao)
-	} else {
-		//log.Printf("New target %X created for ES update\n",newTi.Icao_addr)
-		ti.Last_seen = stratuxClock.Time // need to initialize to current stratuxClock so it doesn't get cut before we have a chance to populate a position message
-		ti.Icao_addr = icao
-		ti.ExtrapolatedPosition = false
-	}
-	hdg := float64((int32(stratuxClock.Milliseconds/1000)+offset)%720) / 2
-	// gs := float64(220) // knots
-	radius := gs * 0.2 / (2 * math.Pi)
-	x := radius * math.Cos(hdg*math.Pi/180.0)
-	y := radius * math.Sin(hdg*math.Pi/180.0)
-	// default traffic location is Oshkosh if GPS not detected
-	lat := 43.99
-	lng := -88.56
-	if isGPSValid() {
-		lat = float64(mySituation.GPSLatitude)
-		lng = float64(mySituation.GPSLongitude)
-	}
-	traffRelLat := y / 60
-	traffRelLng := -x / (60 * math.Cos(lat*math.Pi/180.0))
+	func() {
+		trafficMutex.Lock()
+		defer trafficMutex.Unlock()
 
-	ti.Icao_addr = icao
-	ti.OnGround = false
-	ti.Addr_type = uint8(icao % 4) // 0 == ADS-B; 1 == reserved; 2 == TIS-B with ICAO address; 3 == TIS-B without ICAO address; 6 == ADS-R
-	if ti.Addr_type == 1 {         // reassign "reserved value" to ADS-R
-		ti.Addr_type = 6
-	}
-
-	if ti.Addr_type == 0 {
-		ti.TargetType = TARGET_TYPE_ADSB
-	} else if ti.Addr_type == 3 {
-		ti.TargetType = TARGET_TYPE_TISB
-	} else if ti.Addr_type == 6 {
-		ti.TargetType = TARGET_TYPE_ADSR
-	} else if ti.Addr_type == 2 {
-		ti.TargetType = TARGET_TYPE_TISB_S
-		if (ti.NIC >= 7) && (ti.Emitter_category > 0) { // If NIC is sufficiently high and emitter type is transmitted, we'll assume it's ADS-R.
-			ti.TargetType = TARGET_TYPE_ADSR
+		// Retrieve previous information on this ICAO code.
+		if val, ok := traffic[icao]; ok { // if we've already seen it, copy it in to do updates
+			ti = val
+		} else {
+			ti.Last_seen = stratuxClock.GetTime() // need to initialize to current stratuxClock so it doesn't get cut before we have a chance to populate a position message
+			ti.Icao_addr = icao
+			ti.ExtrapolatedPosition = false
 		}
-	}
+		hdg := float64((int32(stratuxClock.GetMilliseconds()/1000)+offset)%720) / 2
+		radius := gs * 0.2 / (2 * math.Pi)
+		x := radius * math.Cos(hdg*math.Pi/180.0)
+		y := radius * math.Sin(hdg*math.Pi/180.0)
+		// default traffic location is Oshkosh if GPS not detected
+		lat := 43.99
+		lng := -88.56
+		mySituation.muGPS.Lock()
+		gpsLat := mySituation.GPSLatitude
+		gpsLng := mySituation.GPSLongitude
+		gpsAltMSL := mySituation.GPSAltitudeMSL
+		mySituation.muGPS.Unlock()
+		if isGPSValid() {
+			lat = float64(gpsLat)
+			lng = float64(gpsLng)
+		}
+		traffRelLat := y / 60
+		traffRelLng := -x / (60 * math.Cos(lat*math.Pi/180.0))
 
-	ti.Emitter_category = 1
-	ti.Lat = float32(lat + traffRelLat)
-	ti.Lng = float32(lng + traffRelLng)
+		ti.Icao_addr = icao
+		ti.OnGround = false
+		ti.Addr_type = uint8(icao % 4) // 0 == ADS-B; 1 == reserved; 2 == TIS-B with ICAO address; 3 == TIS-B without ICAO address; 6 == ADS-R
+		if ti.Addr_type == 1 {         // reassign "reserved value" to ADS-R
+			ti.Addr_type = 6
+		}
 
-	ti.Distance, ti.Bearing = common.Distance(float64(lat), float64(lng), float64(ti.Lat), float64(ti.Lng))
-	ti.BearingDist_valid = true
+		if ti.Addr_type == 0 {
+			ti.TargetType = TARGET_TYPE_ADSB
+		} else if ti.Addr_type == 3 {
+			ti.TargetType = TARGET_TYPE_TISB
+		} else if ti.Addr_type == 6 {
+			ti.TargetType = TARGET_TYPE_ADSR
+		} else if ti.Addr_type == 2 {
+			ti.TargetType = TARGET_TYPE_TISB_S
+			if (ti.NIC >= 7) && (ti.Emitter_category > 0) { // If NIC is sufficiently high and emitter type is transmitted, we'll assume it's ADS-R.
+				ti.TargetType = TARGET_TYPE_ADSR
+			}
+		}
 
-	ti.Position_valid = true
-	ti.ExtrapolatedPosition = false
-	ti.Alt = int32(mySituation.GPSAltitudeMSL + relAlt)
-	ti.Track = float32(hdg)
-	ti.Speed = uint16(gs)
-	if hdg >= 240 && hdg < 270 {
-		ti.OnGround = true
-	}
-	if hdg > 135 && hdg < 150 {
-		ti.Speed_valid = false
-	} else {
-		ti.Speed_valid = true
-	}
-	ti.Vvel = 0
-	ti.Tail = tail // "DEMO1234"
-	ti.Timestamp = time.Now()
-	ti.Last_seen = stratuxClock.Time
-	ti.Last_alt = stratuxClock.Time
-	ti.Last_speed = stratuxClock.Time
-	ti.NACp = 8
-	ti.NIC = 8
+		ti.Emitter_category = 1
+		ti.Lat = float32(lat + traffRelLat)
+		ti.Lng = float32(lng + traffRelLng)
 
-	//ti.Age = math.Floor(ti.Age) + hdg / 1000
-	ti.Last_source = 1
-	if icao%5 == 1 { // make some of the traffic look like it came from UAT
-		ti.Last_source = 2
-	}
+		ti.Distance, ti.Bearing = common.Distance(float64(lat), float64(lng), float64(ti.Lat), float64(ti.Lng))
+		ti.BearingDist_valid = true
 
-	if hdg < 150 || hdg > 240 {
-		// now insert this into the traffic map...
-		postProcessTraffic(&ti)
-		traffic[ti.Icao_addr] = ti
+		ti.Position_valid = true
+		ti.ExtrapolatedPosition = false
+		ti.Alt = int32(gpsAltMSL + relAlt)
+		ti.Track = float32(hdg)
+		ti.Speed = uint16(gs)
+		if hdg >= 240 && hdg < 270 {
+			ti.OnGround = true
+		}
+		if hdg > 135 && hdg < 150 {
+			ti.Speed_valid = false
+		} else {
+			ti.Speed_valid = true
+		}
+		ti.Vvel = 0
+		ti.Tail = tail // "DEMO1234"
+		ti.Timestamp = time.Now()
+		nowMono := stratuxClock.GetTime()
+		ti.Last_seen = nowMono
+		ti.Last_alt = nowMono
+		ti.Last_speed = nowMono
+		ti.Age = 0
+		ti.NACp = 8
+		ti.NIC = 8
+
+		ti.Last_source = 1
+		if icao%5 == 1 { // make some of the traffic look like it came from UAT
+			ti.Last_source = 2
+		}
+
+		if hdg < 150 || hdg > 240 {
+			// now insert this into the traffic map...
+			postProcessTraffic(&ti)
+			traffic[ti.Icao_addr] = ti
+			markTrafficSeen(ti.Icao_addr)
+			shouldBroadcast = true
+		}
+	}()
+
+	if shouldBroadcast {
 		registerTrafficUpdate(ti)
-		seenTraffic[ti.Icao_addr] = true
 	}
 }
 

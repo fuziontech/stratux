@@ -277,13 +277,13 @@
       if(lambda[i+1] != A0)
 	den ^= ALPHA_TO[MODNN(lambda[i+1] + i * root[j])];
     }
-#if DEBUG >= 1
     if (den == 0) {
+#if DEBUG >= 1
       printf("\n ERROR: denominator = 0\n");
+#endif
       count = -1;
       goto finish;
     }
-#endif
     /* Apply error to data */
     if (num1 != 0 && loc[j] >= PAD) {
       data[loc[j]-PAD] ^= ALPHA_TO[MODNN(INDEX_OF[num1] + INDEX_OF[num2] + NN - INDEX_OF[den])];

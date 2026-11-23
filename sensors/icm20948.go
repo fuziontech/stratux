@@ -2,6 +2,8 @@
 package sensors
 
 import (
+	"errors"
+
 	"github.com/kidoman/embd"
 	"github.com/stratux/goflying/icm20948"
 )
@@ -11,6 +13,8 @@ const (
 	accelRange = 4   // accelRange is the default range to use for the Accel.
 	updateFreq = 50  // updateFreq is the rate at which to update the sensor values.
 )
+
+var errICM20948Closed = errors.New("ICM20948 Error: sensor channel closed")
 
 // ICM20948 represents an InvenSense ICM-20948 attached to the I2C bus and satisfies
 // the IMUReader interface.
@@ -43,6 +47,11 @@ func NewICM20948(i2cbus *embd.I2CBus) (*ICM20948, error) {
 // Read returns the average (since last reading) time, Gyro X-Y-Z, Accel X-Y-Z, Mag X-Y-Z,
 // error reading Gyro/Accel, and error reading Mag.
 func (m *ICM20948) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GAError, MAGError error) {
+	if m == nil || m.mpu == nil {
+		GAError = errICM20948Closed
+		MAGError = errICM20948Closed
+		return
+	}
 	var (
 		data *icm20948.MPUData
 		i    int8
@@ -50,7 +59,13 @@ func (m *ICM20948) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, 
 	data = new(icm20948.MPUData)
 
 	for data.N == 0 && i < 5 {
-		data = <-m.mpu.CAvg
+		var ok bool
+		data, ok = <-m.mpu.CAvg
+		if !ok || data == nil {
+			GAError = errICM20948Closed
+			MAGError = errICM20948Closed
+			return
+		}
 		T = data.T.UnixNano()
 		G1 = data.G1
 		G2 = data.G2
@@ -71,12 +86,17 @@ func (m *ICM20948) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, 
 // ReadOne returns the most recent time, Gyro X-Y-Z, Accel X-Y-Z, Mag X-Y-Z,
 // error reading Gyro/Accel, and error reading Mag.
 func (m *ICM20948) ReadOne() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GAError, MAGError error) {
-	var (
-		data *icm20948.MPUData
-	)
-	data = new(icm20948.MPUData)
-
-	data = <-m.mpu.C
+	if m == nil || m.mpu == nil {
+		GAError = errICM20948Closed
+		MAGError = errICM20948Closed
+		return
+	}
+	data, ok := <-m.mpu.C
+	if !ok || data == nil {
+		GAError = errICM20948Closed
+		MAGError = errICM20948Closed
+		return
+	}
 	T = data.T.UnixNano()
 	G1 = data.G1
 	G2 = data.G2
@@ -94,5 +114,7 @@ func (m *ICM20948) ReadOne() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float6
 
 // Close stops reading the MPU.
 func (m *ICM20948) Close() {
-	m.mpu.CloseMPU()
+	if m != nil && m.mpu != nil {
+		m.mpu.CloseMPU()
+	}
 }

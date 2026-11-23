@@ -1,30 +1,37 @@
 # Image for building Stratux
 #
-FROM debian:bookworm
+FROM golang:1.23-bookworm
 
-# file and nano are nice to have
+ARG TARGETARCH
+
 RUN apt-get update \
-  && apt-get -y install file \
-  && apt-get -y install nano \
-  && apt-get -y install make \
-  && apt-get -y install git \
-  && apt-get -y install gcc \
-  && apt-get -y install ncurses-dev \
-  && apt-get -y install golang-go \
-  && apt-get -y install wget \
-  && apt-get -y install libusb-1.0-0-dev
-
-RUN cd /tmp \
-    && wget https://github.com/stratux/rtlsdr/releases/download/v1.0/librtlsdr0_2.0.2-2_arm64.deb \
-    && dpkg -i librtlsdr0_2.0.2-2_arm64.deb
-
-RUN cd /tmp \
-    && wget https://github.com/stratux/rtlsdr/releases/download/v1.0/librtlsdr-dev_2.0.2-2_arm64.deb \
-    && dpkg -i librtlsdr-dev_2.0.2-2_arm64.deb
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        file \
+        gcc \
+        git \
+        libncurses-dev \
+        libusb-1.0-0-dev \
+        make \
+        nano \
+        pkg-config \
+        sudo \
+        wget \
+    && if [ "${TARGETARCH}" = "arm64" ] || [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+        wget -O /tmp/librtlsdr0_2.0.2-2_arm64.deb https://github.com/stratux/rtlsdr/releases/download/v1.0/librtlsdr0_2.0.2-2_arm64.deb \
+        && wget -O /tmp/librtlsdr-dev_2.0.2-2_arm64.deb https://github.com/stratux/rtlsdr/releases/download/v1.0/librtlsdr-dev_2.0.2-2_arm64.deb \
+        && dpkg -i /tmp/librtlsdr0_2.0.2-2_arm64.deb /tmp/librtlsdr-dev_2.0.2-2_arm64.deb \
+        && rm -f /tmp/librtlsdr0_2.0.2-2_arm64.deb /tmp/librtlsdr-dev_2.0.2-2_arm64.deb; \
+    else \
+        apt-get install -y --no-install-recommends librtlsdr0 librtlsdr-dev; \
+    fi \
+    && rm -rf /var/lib/apt/lists/*
 
 # specific to debian, ubuntu images come with user 'ubuntu' that is uid 1000
 ENV USERNAME="stratux"
 ENV USER_HOME=/home/$USERNAME
 
-RUN useradd -m -d $USER_HOME -s /bin/bash $USERNAME \
+RUN useradd -m -d "$USER_HOME" -s /bin/bash "$USERNAME" \
     && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+WORKDIR /data

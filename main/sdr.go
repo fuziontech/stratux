@@ -11,7 +11,10 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"io"
 	"log"
+	"math"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -27,14 +30,15 @@ import (
 
 // Device holds per dongle values and attributes
 type Device struct {
-	dev     *rtl.Context
-	wg      *sync.WaitGroup
-	closeCh chan int
-	indexID int
-	ppm     int
-	gain     float64
-	serial  string
-	idSet   bool
+	dev       *rtl.Context
+	wg        *sync.WaitGroup
+	closeCh   chan int
+	closeOnce sync.Once
+	indexID   int
+	ppm       int
+	gain      float64
+	serial    string
+	idSet     bool
 }
 
 // UAT is a 978 MHz device
@@ -49,6 +53,8 @@ type OGN Device
 // AIS is an 161 MHz device
 type AIS Device
 
+var sdrDevMutex sync.RWMutex
+
 // UATDev holds a 978 MHz dongle object
 var UATDev *UAT
 
@@ -61,6 +67,18 @@ var OGNDev *OGN
 // AISDev holds a 162 MHz dongle object
 var AISDev *AIS
 
+func hasOGNDev() bool {
+	sdrDevMutex.RLock()
+	defer sdrDevMutex.RUnlock()
+	return OGNDev != nil
+}
+
+func hasAISDev() bool {
+	sdrDevMutex.RLock()
+	defer sdrDevMutex.RUnlock()
+	return AISDev != nil
+}
+
 type Dump1090TermMessage struct {
 	Text   string
 	Source string
@@ -71,134 +89,231 @@ type AISTermMessage struct {
 	Source string
 }
 
+type subprocessConfig struct {
+	name         string
+	bin          string
+	args         []string
+	closeCh      <-chan int
+	shutdownFlag *atomic.Bool
+	lineMode     bool
+	onStdout     func(string)
+	onStderr     func(string)
+}
+
+var subprocessBackoffs = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	15 * time.Second,
+}
+
+func runSubprocess(cfg subprocessConfig) {
+	backoffIdx := 0
+
+	for {
+		select {
+		case <-cfg.closeCh:
+			return
+		default:
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := exec.CommandContext(ctx, cfg.bin, cfg.args...)
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			cancel()
+			log.Printf("%s: Error creating stdout pipe for %s: %s\n", cfg.name, cfg.bin, err)
+			cfg.shutdownFlag.Store(true)
+			<-cfg.closeCh
+			return
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			cancel()
+			log.Printf("%s: Error creating stderr pipe for %s: %s\n", cfg.name, cfg.bin, err)
+			cfg.shutdownFlag.Store(true)
+			<-cfg.closeCh
+			return
+		}
+
+		startTime := time.Now()
+		if err := cmd.Start(); err != nil {
+			cancel()
+			log.Printf("%s: Error executing %s: %s\n", cfg.name, cfg.bin, err)
+			// Don't return immediately, let sdrWatcher drive clean shutdown.
+			cfg.shutdownFlag.Store(true)
+			<-cfg.closeCh
+			return
+		}
+
+		log.Printf("%s: Executed %s successfully...\n", cfg.name, cmd.String())
+
+		var autoRestart atomic.Bool
+		autoRestart.Store(true)
+		procDone := make(chan struct{})
+
+		go func() {
+			select {
+			case <-procDone:
+				return
+			case <-cfg.closeCh:
+				log.Printf("%s read(): shutdown msg received, stopping subprocess...\n", cfg.name)
+				autoRestart.Store(false)
+				cancel()
+				return
+			}
+		}()
+
+		var pipeWG sync.WaitGroup
+		pipeWG.Add(2)
+
+		readPipe := func(r io.Reader, handler func(string)) {
+			defer pipeWG.Done()
+			if cfg.lineMode {
+				scanner := bufio.NewScanner(r)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if len(line) > 0 && handler != nil {
+						handler(line)
+					}
+				}
+				return
+			}
+			buf := make([]byte, 1024)
+			for {
+				n, readErr := r.Read(buf)
+				if n > 0 && handler != nil {
+					handler(string(buf[:n]))
+				}
+				if readErr != nil {
+					return
+				}
+			}
+		}
+
+		go readPipe(stdout, cfg.onStdout)
+		go readPipe(stderr, cfg.onStderr)
+
+		// Go os/exec contract: wait for all pipe reads to finish before cmd.Wait().
+		pipeWG.Wait()
+		_ = cmd.Wait()
+		close(procDone)
+		cancel()
+
+		log.Printf("%s: %s terminated...\n", cfg.name, cfg.bin)
+
+		if !autoRestart.Load() || cfg.shutdownFlag.Load() {
+			return
+		}
+
+		if time.Since(startTime) > 30*time.Second {
+			backoffIdx = 0
+		}
+		waitDur := subprocessBackoffs[backoffIdx]
+		if backoffIdx < len(subprocessBackoffs)-1 {
+			backoffIdx++
+		}
+
+		log.Printf("%s: restarting crashed %s in %s\n", cfg.name, cfg.bin, waitDur)
+		timer := time.NewTimer(waitDur)
+		select {
+		case <-cfg.closeCh:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+var esStrongSignalRegex = regexp.MustCompile(`(\d+(?:\.\d+)?)%\s*>\s*-3dBFS|(\d+(?:\.\d+)?)%\s+strong`)
+
+func parseESStrongSignalLine(s string) {
+	if matches := esStrongSignalRegex.FindStringSubmatch(s); len(matches) >= 3 {
+		pctStr := matches[1]
+		if pctStr == "" {
+			pctStr = matches[2]
+		}
+		if pct, err := strconv.ParseFloat(pctStr, 64); err == nil {
+			hwHealth.RecordESSignalSample(pct)
+		}
+	}
+}
+
 func (e *ES) read() {
 	defer e.wg.Done()
 	log.Println("Entered ES read() ...")
 	// RTL SDR Standard Gains: 0.0 0.9 1.4 2.7 3.7 7.7 8.7 12.5 14.4 15.7 16.6 19.7 20.7 22.9 25.4 28.0 29.7 32.8 33.8 36.4 37.2 38.6 40.2 42.1 43.4 43.9 44.5 48.0 49.6
-	if(e.gain<0.9){
+	if e.gain < 0.9 {
 		e.gain = 37.2
 	}
-	cmd := exec.Command(STRATUX_HOME + "/bin/dump1090", "--fix", "--net-stratux-port", "30006",  "--net", "--device-index", strconv.Itoa(e.indexID),
-		"--ppm", strconv.Itoa(e.ppm),
-		"--gain",strconv.FormatFloat(e.gain,'f',-1,32),
-		"--mlat") // display raw messages in Beast ascii mode
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-	autoRestart := true // automatically restart crashing child process
-
-	err := cmd.Start()
-	if err != nil {
-		log.Printf("Error executing " + STRATUX_HOME + "/bin/dump1090: %s\n", err)
-		// don't return immediately, use the proper shutdown procedure
-		shutdownES = true
-		for {
-			select {
-			case <-e.closeCh:
-				return
-			default:
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}
-
-	log.Println("Executed " + cmd.String() + " successfully...")
-
-	done := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-e.closeCh:
-				log.Println("ES read(): shutdown msg received, calling cmd.Process.Kill() ...")
-				autoRestart = false
-				err := cmd.Process.Kill()
-				if err == nil {
-					log.Println("kill successful...")
-				}
-				return
-			default:
-				time.Sleep(1 * time.Second)
-			}
-		}
+	hwHealth.SetSuggestedESGain(e.gain)
+	hwHealth.SetBandStatus("es", true, true)
+	defer func() {
+		globalSettingsMutex.RLock()
+		esEn := globalSettings.ES_Enabled || globalSettings.Ping_Enabled || globalSettings.Pong_Enabled
+		globalSettingsMutex.RUnlock()
+		globalStatusMutex.RLock()
+		altConn := globalStatus.Ping_connected || globalStatus.Pong_connected
+		globalStatusMutex.RUnlock()
+		hwHealth.SetBandStatus("es", esEn, altConn)
 	}()
-
-	stdoutBuf := make([]byte, 1024)
-	stderrBuf := make([]byte, 1024)
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				n, err := stdout.Read(stdoutBuf)
-				if err == nil && n > 0 {
-					m := Dump1090TermMessage{Text: string(stdoutBuf[:n]), Source: "stdout"}
-					logDump1090TermMessage(m)
-				}
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				n, err := stderr.Read(stderrBuf)
-				if err == nil && n > 0 {
-					m := Dump1090TermMessage{Text: string(stderrBuf[:n]), Source: "stderr"}
-					logDump1090TermMessage(m)
-				}
-			}
-		}
-	}()
-
-	cmd.Wait()
-
-	// we get here if A) the dump1090 process died
-	// on its own or B) cmd.Process.Kill() was called
-	// from within the goroutine, either way close
-	// the "done" channel, which ensures we don't leak
-	// goroutines...
-	close(done)
-
-	if autoRestart && !shutdownES{
-		time.Sleep(5 * time.Second)
-		log.Println("ES: restarting crashed dump1090")
-		e.wg.Add(1)
-		go e.read()
-	}
+	runSubprocess(subprocessConfig{
+		name: "ES",
+		bin:  STRATUX_HOME + "/bin/dump1090",
+		args: []string{
+			"--fix", "--net-stratux-port", "30006", "--net",
+			"--device-index", strconv.Itoa(e.indexID),
+			"--ppm", strconv.Itoa(e.ppm),
+			"--gain", strconv.FormatFloat(e.gain, 'f', -1, 32),
+			"--mlat", // display raw messages in Beast ascii mode
+		},
+		closeCh:      e.closeCh,
+		shutdownFlag: &shutdownES,
+		onStdout: func(s string) {
+			parseESStrongSignalLine(s)
+			logDump1090TermMessage(Dump1090TermMessage{Text: s, Source: "stdout"})
+		},
+		onStderr: func(s string) {
+			parseESStrongSignalLine(s)
+			logDump1090TermMessage(Dump1090TermMessage{Text: s, Source: "stderr"})
+		},
+	})
 }
 
 func (u *UAT) read() {
 	defer u.wg.Done()
 	log.Println("Entered UAT read() ...")
-	var buffer = make([]uint8, rtl.DefaultBufLength)
+	buffer := make([]uint8, rtl.DefaultBufLength)
 
 	for {
 		select {
-		default:
-			nRead, err := u.dev.ReadSync(buffer, rtl.DefaultBufLength)
-			if err != nil {
-				if globalSettings.DEBUG {
-					log.Printf("\tReadSync Failed - error: %s\n", err)
-				}
-				if shutdownUAT != true {
-					shutdownUAT = true
-				}
-				break
-			}
-
-			if nRead > 0 {
-				buf := buffer[:nRead]
-				godump978.InChan <- buf
-			}
 		case <-u.closeCh:
 			log.Println("UAT read(): shutdown msg received...")
 			return
+		default:
+		}
+
+		nRead, err := u.dev.ReadSync(buffer, rtl.DefaultBufLength)
+		if err != nil {
+			if globalSettings.DEBUG {
+				log.Printf("\tReadSync Failed - error: %s\n", err)
+			}
+			shutdownUAT.Store(true)
+			<-u.closeCh
+			return
+		}
+
+		if nRead > 0 {
+			// Allocate an owned copy so the next ReadSync never aliases memory read by C.process_data().
+			buf := make([]uint8, nRead)
+			copy(buf, buffer[:nRead])
+			select {
+			case godump978.InChan <- buf:
+			case <-u.closeCh:
+				log.Println("UAT read(): shutdown msg received...")
+				return
+			}
 		}
 	}
 }
@@ -210,211 +325,66 @@ func (f *OGN) read() {
 	// ogn-rx doesn't like the time jumping forward while running.. delay initial startup until we have a valid system time
 	if !isGPSClockValid() {
 		log.Printf("Delaying ogn-rx start until we have a valid GPS time")
-		loop: for {
+		ticker := time.NewTicker(1 * time.Second)
+	waitLoop:
+		for {
 			select {
-			case <- f.closeCh:
+			case <-f.closeCh:
+				ticker.Stop()
 				return
-			default:
+			case <-ticker.C:
 				if isGPSClockValid() {
-					break loop
-				} else {
-					time.Sleep(1 * time.Second)
+					break waitLoop
 				}
 			}
 		}
+		ticker.Stop()
 	}
 
-	args := []string {"-d", strconv.Itoa(f.indexID), "-p", strconv.Itoa(f.ppm), "-L/var/log/"}
+	args := []string{"-d", strconv.Itoa(f.indexID), "-p", strconv.Itoa(f.ppm), "-L/var/log/"}
 	if !globalSettings.OGNI2CTXEnabled {
 		args = append(args, "-t", "off")
 	}
-	cmd := exec.Command(STRATUX_HOME + "/bin/ogn-rx-eu", args...)
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-	autoRestart := true // automatically restart crashing child process
 
-	err := cmd.Start()
-	if err != nil {
-		log.Printf("OGN: Error executing ogn-rx-eu: %s\n", err)
-		// don't return immediately, use the proper shutdown procedure
-		shutdownOGN = true
-		for {
-			select {
-			case <-f.closeCh:
-				return
-			default:
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}
-
-	log.Println("OGN: Executed ogn-rx-eu successfully...")
-
-	done := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-f.closeCh:
-				log.Println("OGN read(): shutdown msg received, calling cmd.Process.Kill() ...")
-				autoRestart = false
-				err := cmd.Process.Kill()
-				if err == nil {
-					log.Println("kill successful...")
-				}
-				return
-			default:
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}()
-
-	go func() {
-		reader := bufio.NewReader(stdout)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				line, err := reader.ReadString('\n')
-				line = strings.TrimSpace(line)
-				if err == nil  && len(line) > 0 /* && globalSettings.DEBUG */ {
-					log.Println("OGN: ogn-rx-eu stdout: ", line)
-				}
-			}
-		}
-	}()
-
-	go func() {
-		reader := bufio.NewReader(stderr)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				line, err := reader.ReadString('\n')
-				if err == nil {
-					log.Println("OGN: ogn-rx-eu stderr: ", strings.TrimSpace(line))
-				}
-			}
-		}
-	}()
-
-	cmd.Wait()
-
-	log.Println("OGN: ogn-rx-eu terminated...")
-
-	// we get here if A) the ogn-rx-eu process died
-	// on its own or B) cmd.Process.Kill() was called
-	// from within the goroutine, either way close
-	// the "done" channel, which ensures we don't leak
-	// goroutines...
-	close(done)
-
-	if autoRestart && !shutdownOGN{
-		time.Sleep(5 * time.Second)
-		log.Println("OGN: restarting crashed ogn-rx-eu")
-		f.wg.Add(1)
-		go f.read()
-	}
+	runSubprocess(subprocessConfig{
+		name:         "OGN",
+		bin:          STRATUX_HOME + "/bin/ogn-rx-eu",
+		args:         args,
+		closeCh:      f.closeCh,
+		shutdownFlag: &shutdownOGN,
+		lineMode:     true,
+		onStdout: func(line string) {
+			log.Println("OGN: ogn-rx-eu stdout: ", line)
+		},
+		onStderr: func(line string) {
+			log.Println("OGN: ogn-rx-eu stderr: ", line)
+		},
+	})
 }
 
 func (e *AIS) read() {
 	defer e.wg.Done()
 	log.Println("Entered AIS read() ...")
-	cmd := exec.Command(STRATUX_HOME + "/bin/rtl_ais", "-T", "-k", "-p", strconv.Itoa(e.ppm), "-d", strconv.Itoa(e.indexID))
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-
-	err := cmd.Start()
-	if err != nil {
-		log.Printf("Error executing " + STRATUX_HOME + "/bin/rtl_ais: %s\n", err)
-		// don't return immediately, use the proper shutdown procedure
-		shutdownES = true
-		for {
-			select {
-			case <-e.closeCh:
-				return
-			default:
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}
-
-	log.Println("Executed " + cmd.String() + " successfully...")
-
-	done := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-e.closeCh:
-				log.Println("AIS read(): shutdown msg received, calling cmd.Process.Kill() ...")
-				err := cmd.Process.Kill()
-				if err == nil {
-					log.Println("kill successful...")
-				}
-				return
-			default:
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}()
-
-	stdoutBuf := make([]byte, 1024)
-	stderrBuf := make([]byte, 1024)
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				n, err := stdout.Read(stdoutBuf)
-				if err == nil && n > 0 {
-					m := AISTermMessage{Text: string(stdoutBuf[:n]), Source: "stdout"}
-					logAISTermMessage(m)
-				}
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				n, err := stderr.Read(stderrBuf)
-				if err == nil && n > 0 {
-					m := AISTermMessage{Text: string(stderrBuf[:n]), Source: "stderr"}
-					logAISTermMessage(m)
-				}
-			}
-		}
-	}()
-
-	cmd.Wait()
-
-	// we get here if A) the rvt_ais process died
-	// on its own or B) cmd.Process.Kill() was called
-	// from within the goroutine, either way close
-	// the "done" channel, which ensures we don't leak
-	// goroutines...
-	close(done)
+	runSubprocess(subprocessConfig{
+		name:         "AIS",
+		bin:          STRATUX_HOME + "/bin/rtl_ais",
+		args:         []string{"-T", "-k", "-p", strconv.Itoa(e.ppm), "-d", strconv.Itoa(e.indexID)},
+		closeCh:      e.closeCh,
+		shutdownFlag: &shutdownAIS,
+		onStdout: func(s string) {
+			logAISTermMessage(AISTermMessage{Text: s, Source: "stdout"})
+		},
+		onStderr: func(s string) {
+			logAISTermMessage(AISTermMessage{Text: s, Source: "stderr"})
+		},
+	})
 }
 
-func getPPM(serial string) int {
-	r, err := regexp.Compile("str?a?t?u?x:\\d+:?(-?\\d*)")
-	if err != nil {
-		return globalSettings.PPM
-	}
+var ppmRegex = regexp.MustCompile(`str?a?t?u?x:\d+:?(-?\d*)`)
 
-	arr := r.FindStringSubmatch(serial)
-	if arr == nil {
+func getPPM(serial string) int {
+	arr := ppmRegex.FindStringSubmatch(serial)
+	if len(arr) < 2 {
 		return globalSettings.PPM
 	}
 
@@ -428,19 +398,27 @@ func getPPM(serial string) int {
 
 func (e *ES) sdrConfig() (err error) {
 	e.ppm = getPPM(e.serial)
+	globalSettingsMutex.RLock()
 	e.gain = globalSettings.Dump1090Gain
-	log.Printf("===== ES Device Serial: %s PPM %d Gain %.1f =====\n", e.serial, e.ppm,e.gain)
+	globalSettingsMutex.RUnlock()
+	if e.gain > 0 {
+		hwHealth.SetSuggestedESGain(e.gain)
+	}
+	hwHealth.RecordEstimatedPPM("es", e.ppm)
+	log.Printf("===== ES Device Serial: %s PPM %d Gain %.1f =====\n", e.serial, e.ppm, e.gain)
 	return
 }
 
 func (f *OGN) sdrConfig() (err error) {
 	f.ppm = getPPM(f.serial)
+	hwHealth.RecordEstimatedPPM("ogn", f.ppm)
 	log.Printf("===== OGN Device Serial: %s PPM %d =====\n", f.serial, f.ppm)
 	return
 }
 
 func (f *AIS) sdrConfig() (err error) {
 	f.ppm = getPPM(f.serial)
+	hwHealth.RecordEstimatedPPM("ais", f.ppm)
 	log.Printf("===== AIS Device Serial: %s PPM %d =====\n", f.serial, f.ppm)
 	return
 }
@@ -484,6 +462,11 @@ func (u *UAT) sdrConfig() (err error) {
 
 	tgain := u.dev.GetTunerGain()
 	log.Printf("\tGetTunerGain: %d\n", tgain)
+	if tgain > 0 {
+		u.gain = float64(tgain) / 10.0
+	} else {
+		u.gain = float64(TunerGain) / 10.0
+	}
 
 	//---------- Get/Set Sample Rate ----------
 	err = u.dev.SetSampleRate(SampleRate)
@@ -552,6 +535,7 @@ func (u *UAT) sdrConfig() (err error) {
 		log.Printf("\tSetFreqCorrection %d Failed, error: %s\n", u.ppm, err)
 		return
 	}
+	hwHealth.RecordEstimatedPPM("uat", u.ppm)
 	log.Printf("\tSetFreqCorrection %d Successful\n", u.ppm)
 
 	return
@@ -560,8 +544,7 @@ func (u *UAT) sdrConfig() (err error) {
 // Read from the godump978 channel - on or off.
 func uatReader() {
 	log.Println("Entered uatReader() ...")
-	for {
-		uat := <-godump978.OutChan
+	for uat := range godump978.OutChan {
 		TraceLog.Record(CONTEXT_GODUMP978, []byte(uat))
 		handleUatMessage(uat)
 	}
@@ -612,18 +595,23 @@ func (f *AIS) writeID() error {
 
 func (u *UAT) shutdown() {
 	log.Println("Entered UAT shutdown() ...")
-	close(u.closeCh) // signal to shutdown
+	u.closeOnce.Do(func() {
+		close(u.closeCh) // signal to shutdown
+	})
+	log.Println("UAT shutdown(): closing device to preempt ReadSync ...")
+	if u.dev != nil {
+		u.dev.Close() // preempt the blocking ReadSync call before waiting
+	}
 	log.Println("UAT shutdown(): calling u.wg.Wait() ...")
 	u.wg.Wait() // Wait for the goroutine to shutdown
-	log.Println("UAT shutdown(): u.wg.Wait() returned...")
-	log.Println("UAT shutdown(): closing device ...")
-	u.dev.Close() // preempt the blocking ReadSync call
 	log.Println("UAT shutdown() complete ...")
 }
 
 func (e *ES) shutdown() {
 	log.Println("Entered ES shutdown() ...")
-	close(e.closeCh) // signal to shutdown
+	e.closeOnce.Do(func() {
+		close(e.closeCh) // signal to shutdown
+	})
 	log.Println("ES shutdown(): calling e.wg.Wait() ...")
 	e.wg.Wait() // Wait for the goroutine to shutdown
 	log.Println("ES shutdown() complete ...")
@@ -631,29 +619,38 @@ func (e *ES) shutdown() {
 
 func (f *OGN) shutdown() {
 	log.Println("Entered OGN shutdown() ...")
-	close(f.closeCh) // signal to shutdown
-	log.Println("signal shutdown(): calling f.wg.Wait() ...")
+	f.closeOnce.Do(func() {
+		close(f.closeCh) // signal to shutdown
+	})
+	log.Println("OGN shutdown(): calling f.wg.Wait() ...")
 	f.wg.Wait() // Wait for the goroutine to shutdown
-	log.Println("signal shutdown() complete ...")
+	log.Println("OGN shutdown() complete ...")
 }
 
 func (f *AIS) shutdown() {
 	log.Println("Entered AIS shutdown() ...")
-	close(f.closeCh) // signal to shutdown
-	log.Println("signal shutdown(): calling f.wg.Wait() ...")
+	f.closeOnce.Do(func() {
+		close(f.closeCh) // signal to shutdown
+	})
+	log.Println("AIS shutdown(): calling f.wg.Wait() ...")
 	f.wg.Wait() // Wait for the goroutine to shutdown
-	log.Println("signal shutdown() complete ...")
+	log.Println("AIS shutdown() complete ...")
 }
 
-var sdrShutdown bool
+var (
+	sdrShutdown       atomic.Bool
+	sdrWatcherStarted atomic.Bool
+	sdrDoneCh         = make(chan struct{})
+)
 
 func sdrKill() {
 	// Send signal to shutdown to sdrWatcher().
-	sdrShutdown = true
-	// Spin until all devices have been de-initialized.
-	for UATDev != nil || ESDev != nil || OGNDev != nil || AISDev != nil {
-		time.Sleep(1 * time.Second)
+	sdrShutdown.Store(true)
+	if !sdrWatcherStarted.Load() {
+		return
 	}
+	// Wait until sdrWatcher() has de-initialized all devices.
+	<-sdrDoneCh
 }
 
 func reCompile(s string) *regexp.Regexp {
@@ -669,7 +666,7 @@ type regexAIS regexp.Regexp
 
 var rUAT = (*regexUAT)(reCompile("str?a?t?u?x:978"))
 var rES = (*regexES)(reCompile("str?a?t?u?x:1090"))
-var rOGN = (*regexES)(reCompile("str?a?t?u?x:868"))
+var rOGN = (*regexOGN)(reCompile("str?a?t?u?x:868"))
 var rAIS = (*regexAIS)(reCompile("str?a?t?u?x:162"))
 
 func (r *regexUAT) hasID(serial string) bool {
@@ -701,63 +698,91 @@ func (r *regexAIS) hasID(serial string) bool {
 }
 
 func createUATDev(id int, serial string, idSet bool) error {
-	UATDev = &UAT{indexID: id, serial: serial}
-	if err := UATDev.sdrConfig(); err != nil {
+	dev := &UAT{indexID: id, serial: serial}
+	if err := dev.sdrConfig(); err != nil {
 		log.Printf("UATDev.sdrConfig() failed: %s\n", err)
-		UATDev = nil
 		return err
 	}
-	UATDev.wg = &sync.WaitGroup{}
-	UATDev.idSet = idSet
-	UATDev.closeCh = make(chan int)
-	UATDev.wg.Add(1)
-	go UATDev.read()
+	dev.wg = &sync.WaitGroup{}
+	dev.idSet = idSet
+	dev.closeCh = make(chan int)
+	dev.wg.Add(1)
+	sdrDevMutex.Lock()
+	UATDev = dev
+	sdrDevMutex.Unlock()
+	go dev.read()
 	return nil
 }
 
 func createESDev(id int, serial string, idSet bool) error {
-	ESDev = &ES{indexID: id, serial: serial}
-	if err := ESDev.sdrConfig(); err != nil {
+	dev := &ES{indexID: id, serial: serial}
+	if err := dev.sdrConfig(); err != nil {
 		log.Printf("ESDev.sdrConfig() failed: %s\n", err)
-		ESDev = nil
 		return err
 	}
-	ESDev.wg = &sync.WaitGroup{}
-	ESDev.idSet = idSet
-	ESDev.closeCh = make(chan int)
-	ESDev.wg.Add(1)
-	go ESDev.read()
+	dev.wg = &sync.WaitGroup{}
+	dev.idSet = idSet
+	dev.closeCh = make(chan int)
+	dev.wg.Add(1)
+	sdrDevMutex.Lock()
+	ESDev = dev
+	sdrDevMutex.Unlock()
+	go dev.read()
 	return nil
 }
 
 func createOGNDev(id int, serial string, idSet bool) error {
-	OGNDev = &OGN{indexID: id, serial: serial}
-	if err := OGNDev.sdrConfig(); err != nil {
+	dev := &OGN{indexID: id, serial: serial}
+	if err := dev.sdrConfig(); err != nil {
 		log.Printf("OGNDev.sdrConfig() failed: %s\n", err)
-		OGNDev = nil
 		return err
 	}
-	OGNDev.wg = &sync.WaitGroup{}
-	OGNDev.idSet = idSet
-	OGNDev.closeCh = make(chan int)
-	OGNDev.wg.Add(1)
-	go OGNDev.read()
+	dev.wg = &sync.WaitGroup{}
+	dev.idSet = idSet
+	dev.closeCh = make(chan int)
+	dev.wg.Add(1)
+	sdrDevMutex.Lock()
+	OGNDev = dev
+	sdrDevMutex.Unlock()
+	go dev.read()
 	return nil
 }
 
 func createAISDev(id int, serial string, idSet bool) error {
-	AISDev = &AIS{indexID: id, serial: serial}
-	if err := AISDev.sdrConfig(); err != nil {
+	dev := &AIS{indexID: id, serial: serial}
+	if err := dev.sdrConfig(); err != nil {
 		log.Printf("AISDev.sdrConfig() failed: %s\n", err)
-		AISDev = nil
 		return err
 	}
-	AISDev.wg = &sync.WaitGroup{}
-	AISDev.idSet = idSet
-	AISDev.closeCh = make(chan int)
-	AISDev.wg.Add(1)
-	go AISDev.read()
+	dev.wg = &sync.WaitGroup{}
+	dev.idSet = idSet
+	dev.closeCh = make(chan int)
+	dev.wg.Add(1)
+	sdrDevMutex.Lock()
+	AISDev = dev
+	sdrDevMutex.Unlock()
+	go dev.read()
 	return nil
+}
+
+func shutdownAllSDRDevices() {
+	sdrDevMutex.Lock()
+	uat, es, ogn, ais := UATDev, ESDev, OGNDev, AISDev
+	UATDev, ESDev, OGNDev, AISDev = nil, nil, nil, nil
+	sdrDevMutex.Unlock()
+
+	if uat != nil {
+		uat.shutdown()
+	}
+	if es != nil {
+		es.shutdown()
+	}
+	if ogn != nil {
+		ogn.shutdown()
+	}
+	if ais != nil {
+		ais.shutdown()
+	}
 }
 
 func configDevices(count int, esEnabled, uatEnabled, ognEnabled, aisEnabled bool) {
@@ -791,13 +816,15 @@ func configDevices(count int, esEnabled, uatEnabled, ognEnabled, aisEnabled bool
 	}
 
 	// loop 2: assign anonymous dongles but sanity check the serial ids
-	// so we don't cross config for dual assigned dongles. e.g. when two
-	// dongles are set to the same stratux id and the unconsumed,
-	// non-anonymous, dongle makes it to this loop.
+	// so we don't cross config for dual assigned dongles or steal dongles
+	// explicitly tagged for a disabled band.
 	for i, s := range unusedIDs {
-		if uatEnabled && !globalStatus.UATRadio_connected && UATDev == nil && !rES.hasID(s) && !rOGN.hasID(s) {
+		if rUAT.hasID(s) || rES.hasID(s) || rOGN.hasID(s) || rAIS.hasID(s) {
+			continue
+		}
+		if uatEnabled && !globalStatus.UATRadio_connected && UATDev == nil {
 			createUATDev(i, s, false)
-		} else if esEnabled && ESDev == nil && !rUAT.hasID(s) && !rOGN.hasID(s) {
+		} else if esEnabled && ESDev == nil {
 			createESDev(i, s, false)
 		} else if ognEnabled && OGNDev == nil {
 			createOGNDev(i, s, false)
@@ -810,26 +837,34 @@ func configDevices(count int, esEnabled, uatEnabled, ognEnabled, aisEnabled bool
 // to keep our sync primitives synchronized, only exit a read
 // method's goroutine via the close flag channel check, to
 // include catastrophic dongle failures
-var shutdownES bool
-var shutdownUAT bool
-var shutdownOGN bool
-var shutdownAIS bool
+var (
+	shutdownES  atomic.Bool
+	shutdownUAT atomic.Bool
+	shutdownOGN atomic.Bool
+	shutdownAIS atomic.Bool
+)
 
 // Watch for config/device changes.
 func sdrWatcher() {
+	sdrWatcherStarted.Store(true)
+	defer close(sdrDoneCh)
+
 	prevCount := 0
 	prevUATEnabled := false
 	prevESEnabled := false
 	prevOGNEnabled := false
 	prevAISEnabled := false
 	prevOGNTXEnabled := false
+	globalSettingsMutex.RLock()
 	prevdump1090Gain := globalSettings.Dump1090Gain
+	devMode := globalSettings.DeveloperMode
+	globalSettingsMutex.RUnlock()
 
 	// Get the system (RPi) uptime.
 	info := syscall.Sysinfo_t{}
 	err := syscall.Sysinfo(&info)
 
-	if err == nil && info.Uptime > 120 && globalSettings.DeveloperMode {
+	if err == nil && info.Uptime > 120 && devMode {
 		// Throw a "critical error" if developer mode is enabled. Alerts the developer that the daemon was restarted (possibly)
 		//  unexpectedly.
 		addSingleSystemErrorf("restart-warn", "System uptime %d seconds. Daemon was restarted.\n", info.Uptime)
@@ -837,107 +872,156 @@ func sdrWatcher() {
 
 	// Got system uptime. Delay SDR start for a bit to reduce noise for the GPS to get a fix.
 	// Will give up waiting after 120s without fix
-	for err == nil && info.Uptime < 120 && !isGPSValid()  {
+	for err == nil && info.Uptime < 120 && !isGPSValid() && !sdrShutdown.Load() {
 		time.Sleep(1 * time.Second)
 		err = syscall.Sysinfo(&info)
 	}
 
+	var lastHealthSample time.Time
+	updateBandHealth := func(uatEn, esEn, ognEn, aisEn, pingEn, pongEn, uatRadioConn, pingConn, pongConn, ognConn, aisConn bool) {
+		sdrDevMutex.RLock()
+		hasUAT := UATDev != nil
+		hasES := ESDev != nil
+		hasOGN := OGNDev != nil
+		hasAIS := AISDev != nil
+		sdrDevMutex.RUnlock()
+
+		hwHealth.SetBandStatus("uat", uatEn || pingEn || pongEn, hasUAT || uatRadioConn || pingConn || pongConn)
+		hwHealth.SetBandStatus("es", esEn || pingEn || pongEn, hasES || pingConn || pongConn)
+		hwHealth.SetBandStatus("ogn", ognEn, hasOGN || ognConn)
+		hwHealth.SetBandStatus("ais", aisEn, hasAIS || aisConn)
+	}
+
 	for {
 		time.Sleep(1 * time.Second)
-		if sdrShutdown {
-			if UATDev != nil {
-				UATDev.shutdown()
-				UATDev = nil
-			}
-			if ESDev != nil {
-				ESDev.shutdown()
-				ESDev = nil
-			}
-			if OGNDev != nil {
-				OGNDev.shutdown()
-				OGNDev = nil
-			}
-			if AISDev != nil {
-				AISDev.shutdown()
-				AISDev = nil
-			}
+		if sdrShutdown.Load() {
+			shutdownAllSDRDevices()
 			return
 		}
 
 		// true when a ReadSync call fails
-		if shutdownUAT {
-			if UATDev != nil {
-				UATDev.shutdown()
-				UATDev = nil
+		if shutdownUAT.Swap(false) {
+			sdrDevMutex.Lock()
+			dev := UATDev
+			UATDev = nil
+			sdrDevMutex.Unlock()
+			if dev != nil {
+				dev.shutdown()
 			}
-			shutdownUAT = false
 		}
-		// true when we get stderr output
-		if shutdownES {
-			if ESDev != nil {
-				ESDev.shutdown()
-				ESDev = nil
+		// true when subprocess startup fails
+		if shutdownES.Swap(false) {
+			sdrDevMutex.Lock()
+			dev := ESDev
+			ESDev = nil
+			sdrDevMutex.Unlock()
+			if dev != nil {
+				dev.shutdown()
 			}
-			shutdownES = false
 		}
-		// true when we get stderr output
-		if shutdownOGN {
-			if OGNDev != nil {
-				OGNDev.shutdown()
-				OGNDev = nil
+		if shutdownOGN.Swap(false) {
+			sdrDevMutex.Lock()
+			dev := OGNDev
+			OGNDev = nil
+			sdrDevMutex.Unlock()
+			if dev != nil {
+				dev.shutdown()
 			}
-			shutdownOGN = false
 		}
-		if shutdownAIS {
-			if AISDev != nil {
-				AISDev.shutdown()
-				AISDev = nil
+		if shutdownAIS.Swap(false) {
+			sdrDevMutex.Lock()
+			dev := AISDev
+			AISDev = nil
+			sdrDevMutex.Unlock()
+			if dev != nil {
+				dev.shutdown()
 			}
-			shutdownAIS = false
 		}
 
 		// capture current state
+		globalSettingsMutex.RLock()
 		esEnabled := globalSettings.ES_Enabled
 		uatEnabled := globalSettings.UAT_Enabled
 		ognEnabled := globalSettings.OGN_Enabled
 		aisEnabled := globalSettings.AIS_Enabled
+		pingEnabled := globalSettings.Ping_Enabled
+		pongEnabled := globalSettings.Pong_Enabled
 		ognTXEnabled := globalSettings.OGNI2CTXEnabled
 		dump1090Gain := globalSettings.Dump1090Gain
+		autoGainEnabled := globalSettings.AutoGain_Enabled
+		globalSettingsMutex.RUnlock()
+
+		globalStatusMutex.RLock()
+		uatRadioConnected := globalStatus.UATRadio_connected
+		pingConnected := globalStatus.Ping_connected
+		pongConnected := globalStatus.Pong_connected
+		ognConnected := globalStatus.OGN_connected
+		aisConnected := globalStatus.AIS_connected
+		globalStatusMutex.RUnlock()
+
+		// Every 5 seconds, sample UAT IQ clipping / dropped frames, update band status,
+		// and apply UAT auto-gain step adjustments when enabled.
+		if lastHealthSample.IsZero() || time.Since(lastHealthSample) >= 5*time.Second {
+			lastHealthSample = time.Now()
+			iq := godump978.GetIQStats(true)
+			dropped := godump978.GetDroppedFrames()
+			hwHealth.RecordUATIQStats(iq.ClippedPercent, iq.MeanAmplitude, dropped)
+
+			if dump1090Gain > 0 {
+				hwHealth.SetSuggestedESGain(dump1090Gain)
+			}
+
+			if autoGainEnabled && iq.TotalSamples > 0 {
+				sdrDevMutex.Lock()
+				if UATDev != nil && UATDev.dev != nil {
+					currentUATGain := UATDev.gain
+					if currentUATGain <= 0 {
+						currentUATGain = float64(TunerGain) / 10.0
+					}
+					newGain, changed := ComputeGainStep(currentUATGain, iq.ClippedPercent, iq.MeanAmplitude < 6.0)
+					if changed {
+						gainTenths := int(math.Round(newGain * 10))
+						if setErr := UATDev.dev.SetTunerGain(gainTenths); setErr != nil {
+							log.Printf("UAT Auto-Gain: SetTunerGain(%.1f dB) failed: %s\n", newGain, setErr)
+						} else {
+							UATDev.gain = newGain
+							log.Printf("UAT Auto-Gain: adjusted gain %.1f dB -> %.1f dB (clipped=%.2f%%, meanAmp=%.1f)\n",
+								currentUATGain, newGain, iq.ClippedPercent, iq.MeanAmplitude)
+						}
+					}
+				}
+				sdrDevMutex.Unlock()
+			}
+
+			updateBandHealth(uatEnabled, esEnabled, ognEnabled, aisEnabled, pingEnabled, pongEnabled,
+				uatRadioConnected, pingConnected, pongConnected, ognConnected, aisConnected)
+		}
+
 		count := rtl.GetDeviceCount()
 		interfaceCount := count
-		if globalStatus.UATRadio_connected {
+		if uatRadioConnected {
 			interfaceCount++
 		}
 		atomic.StoreUint32(&globalStatus.Devices, uint32(interfaceCount))
 
-		// support up to 3 dongles
-		if count > 3 {
-			count = 3
+		// support up to 4 dongles (UAT, 1090ES, OGN, AIS)
+		if count > 4 {
+			count = 4
 		}
 
 		if interfaceCount == prevCount && prevESEnabled == esEnabled && prevUATEnabled == uatEnabled && prevOGNEnabled == ognEnabled && prevAISEnabled == aisEnabled &&
-			prevOGNTXEnabled == ognTXEnabled  && prevdump1090Gain == dump1090Gain {
+			prevOGNTXEnabled == ognTXEnabled && prevdump1090Gain == dump1090Gain {
 			continue
 		}
 
 		// the device count or the global settings have changed, reconfig
-		if UATDev != nil {
-			UATDev.shutdown()
-			UATDev = nil
-		}
-		if ESDev != nil {
-			ESDev.shutdown()
-			ESDev = nil
-		}
-		if OGNDev != nil {
-			OGNDev.shutdown()
-			OGNDev = nil
-		}
-		if AISDev != nil {
-			AISDev.shutdown()
-			AISDev = nil
-		}
+		shutdownAllSDRDevices()
 		configDevices(count, esEnabled, uatEnabled, ognEnabled, aisEnabled)
+		if dump1090Gain > 0 {
+			hwHealth.SetSuggestedESGain(dump1090Gain)
+		}
+		updateBandHealth(uatEnabled, esEnabled, ognEnabled, aisEnabled, pingEnabled, pongEnabled,
+			uatRadioConnected, pingConnected, pongConnected, ognConnected, aisConnected)
 
 		prevCount = interfaceCount
 		prevUATEnabled = uatEnabled
@@ -948,26 +1032,41 @@ func sdrWatcher() {
 		prevdump1090Gain = dump1090Gain
 
 		countEnabled := 0
-
-		if uatEnabled { countEnabled++ }
-		if esEnabled { countEnabled++ }
-		if ognEnabled { countEnabled++ }
-		if aisEnabled { countEnabled++ }
+		if uatEnabled {
+			countEnabled++
+		}
+		if esEnabled {
+			countEnabled++
+		}
+		if ognEnabled {
+			countEnabled++
+		}
+		if aisEnabled {
+			countEnabled++
+		}
 		if countEnabled > interfaceCount {
 			// User enabled too many protocols. Show error..
 			used := make([]string, 0)
-			if UATDev != nil { used = append(used, "UAT") }
-			if ESDev != nil { used = append(used, "1090ES") }
-			if OGNDev != nil { used = append(used, "OGN") }
-			if AISDev != nil { used = append(used, "AIS") }
-			addSingleSystemErrorf("sdrconfig", "You have enabled more protocols than you have receivers for. " +
+			sdrDevMutex.RLock()
+			if UATDev != nil || uatRadioConnected {
+				used = append(used, "UAT")
+			}
+			if ESDev != nil {
+				used = append(used, "1090ES")
+			}
+			if OGNDev != nil {
+				used = append(used, "OGN")
+			}
+			if AISDev != nil {
+				used = append(used, "AIS")
+			}
+			sdrDevMutex.RUnlock()
+			addSingleSystemErrorf("sdrconfig", "You have enabled more protocols than you have receivers for. "+
 				"You have %d receivers, but enabled %d protocols. Please disable %d of them for things to work correctly. For now we are only using %s.",
-				count, countEnabled, countEnabled - count, strings.Join(used, ", "))
-
+				interfaceCount, countEnabled, countEnabled-interfaceCount, strings.Join(used, ", "))
 		} else {
 			removeSingleSystemError("sdrconfig")
 		}
-
 	}
 }
 

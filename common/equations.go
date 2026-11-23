@@ -11,122 +11,107 @@
 package common
 
 import (
-	"fmt"
 	"math"
 )
 
-// linReg calculates slope and intercept for a least squares linear regression of y[] vs x[]
-// Returns error if fewer than two data points in each series, or if series lengths are different
-
+// LinReg calculates slope and intercept for a least squares linear regression of y[] vs x[]
+// Returns invalid if fewer than two data points in each series, if series lengths are different,
+// or if the regression is degenerate/non-finite.
 func LinReg(x, y []float64) (slope, intercept float64, valid bool) {
-
 	n := len(x)
+	if n != len(y) || n < 2 {
+		return math.NaN(), math.NaN(), false
+	}
+
 	nf := float64(n)
-
-	if n != len(y) {
-		//fmt.Printf("linReg: Lengths not equal\n")
-		return math.NaN(), math.NaN(), false
-	}
-
-	if n < 2 {
-		//fmt.Printf("linReg: Lengths too short\n")
-		return math.NaN(), math.NaN(), false
-	}
-
-	var Sx, Sy, Sxx, Sxy, Syy float64
-
+	var sumX, sumY float64
 	for i := range x {
-		Sx += x[i]
-		Sy += y[i]
-		Sxx += x[i] * x[i]
-		Sxy += x[i] * y[i]
-		Syy += y[i] * y[i]
+		sumX += x[i]
+		sumY += y[i]
+	}
+	xBar := sumX / nf
+	yBar := sumY / nf
+
+	var sxx, sxy float64
+	for i := range x {
+		dx := x[i] - xBar
+		dy := y[i] - yBar
+		sxx += dx * dx
+		sxy += dx * dy
 	}
 
-	if nf*Sxx == Sx*Sx {
-		//fmt.Printf("linReg: Infinite slope\n")
+	if sxx == 0 {
 		return math.NaN(), math.NaN(), false
 	}
 
-	// Calculate slope and intercept
-	slope = (nf*Sxy - Sx*Sy) / (nf*Sxx - Sx*Sx)
-	intercept = Sy/nf - slope*Sx/nf
-	valid = true
-	return
+	slope = sxy / sxx
+	intercept = yBar - slope*xBar
+	if math.IsNaN(slope) || math.IsInf(slope, 0) || math.IsNaN(intercept) || math.IsInf(intercept, 0) {
+		return math.NaN(), math.NaN(), false
+	}
+	return slope, intercept, true
 }
 
-// linRegWeighted calculates slope and intercept for a weighted least squares
+// LinRegWeighted calculates slope and intercept for a weighted least squares
 // linear regression of y[] vs x[], given weights w[] for each point.
-// Returns error if fewer than two data points in each series, if series lengths are different,
-// if weights sum to zero, or if slope is infinite
-
+// Returns invalid if fewer than two data points in each series, if series lengths are different,
+// if weights sum to zero, or if the regression is degenerate/non-finite.
 func LinRegWeighted(x, y, w []float64) (slope, intercept float64, valid bool) {
-
 	n := len(x)
-
-	if n != len(y) || n != len(w) {
-		//fmt.Printf("linRegWeighted: Lengths not equal\n")
+	if n != len(y) || n != len(w) || n < 2 {
 		return math.NaN(), math.NaN(), false
 	}
 
-	if n < 2 {
-		//fmt.Printf("linRegWeighted: Lengths too short\n")
-		return math.NaN(), math.NaN(), false
-	}
-
-	//var Sx, Sy, Sxx, Sxy, Syy float64
-	var Sw, Swx, Swy, Swxx, Swxy, Swyy float64
-
+	var sw, swx, swy float64
 	for i := range x {
-		Sw += w[i]
-		Swxy += w[i] * x[i] * y[i]
-		Swx += w[i] * x[i]
-		Swy += w[i] * y[i]
-		Swxx += w[i] * x[i] * x[i]
-		Swyy += w[i] * y[i] * y[i]
-		/*
-			Sx += x[i]
-			Sy += y[i]
-			Sxx += x[i]*x[i]
-			Sxy += x[i]*y[i]
-			Syy += y[i]*y[i]
-		*/
+		sw += w[i]
+		swx += w[i] * x[i]
+		swy += w[i] * y[i]
 	}
 
-	if Sw == 0 {
-		//fmt.Printf("linRegWeighted: Sum of weights is zero\n")
+	if sw == 0 || math.IsNaN(sw) || math.IsInf(sw, 0) {
 		return math.NaN(), math.NaN(), false
 	}
 
-	if Sw*Swxx == Swx*Swx {
-		//fmt.Printf("linRegWeighted: Infinite slope\n")
+	xBar := swx / sw
+	yBar := swy / sw
+
+	var sxx, sxy float64
+	for i := range x {
+		dx := x[i] - xBar
+		dy := y[i] - yBar
+		sxx += w[i] * dx * dx
+		sxy += w[i] * dx * dy
+	}
+
+	if sxx == 0 {
 		return math.NaN(), math.NaN(), false
 	}
 
-	// Calculate slope and intercept
-	slope = (Sw*Swxy - Swx*Swy) / (Sw*Swxx - Swx*Swx)
-	intercept = Swy/Sw - slope*Swx/Sw
-	valid = true
-	return
+	slope = sxy / sxx
+	intercept = yBar - slope*xBar
+	if math.IsNaN(slope) || math.IsInf(slope, 0) || math.IsNaN(intercept) || math.IsInf(intercept, 0) {
+		return math.NaN(), math.NaN(), false
+	}
+	return slope, intercept, true
 }
 
-// triCubeWeight returns the value of the tricube weight function
+// TriCubeWeight returns the value of the tricube weight function
 // at point x, for the given center and halfwidth.
 func TriCubeWeight(center, halfwidth, x float64) float64 {
-	var weight, x_t float64
-	x_t = math.Abs((x - center) / halfwidth)
-	if x_t < 1 {
-		weight = math.Pow((1 - math.Pow(x_t, 3)), 3)
-	} else {
-		weight = 0
+	if halfwidth <= 0 || math.IsNaN(halfwidth) {
+		return 0
 	}
-	return weight
+	x_t := math.Abs((x - center) / halfwidth)
+	if x_t < 1 {
+		return math.Pow((1 - math.Pow(x_t, 3)), 3)
+	}
+	return 0
 }
 
-// arrayMin calculates the minimum value in array x
+// ArrayMin calculates the minimum value in array x
 func ArrayMin(x []float64) (float64, bool) {
 	if len(x) < 1 {
-		fmt.Printf("arrayMin: Length too short\n")
 		return math.NaN(), false
 	}
 
@@ -139,10 +124,9 @@ func ArrayMin(x []float64) (float64, bool) {
 	return min, true
 }
 
-// arrayMax calculates the maximum value in array x
+// ArrayMax calculates the maximum value in array x
 func ArrayMax(x []float64) (float64, bool) {
 	if len(x) < 1 {
-		fmt.Printf("arrayMax: Length too short\n")
 		return math.NaN(), false
 	}
 
@@ -155,23 +139,21 @@ func ArrayMax(x []float64) (float64, bool) {
 	return max, true
 }
 
-// arrayRange calculates the range of values in array x
+// ArrayRange calculates the range of values in array x
 func ArrayRange(x []float64) (float64, bool) {
-	max, err1 := ArrayMax(x)
-	min, err2 := ArrayMin(x)
+	max, ok1 := ArrayMax(x)
+	min, ok2 := ArrayMin(x)
 
-	if !err1 || !err2 {
-		fmt.Printf("Error calculating range\n")
+	if !ok1 || !ok2 {
 		return math.NaN(), false
 	}
 
 	return (max - min), true
 }
 
-// mean returns the arithmetic mean of array x
+// Mean returns the arithmetic mean of array x
 func Mean(x []float64) (float64, bool) {
 	if len(x) < 1 {
-		//fmt.Printf("mean: Length too short\n")
 		return math.NaN(), false
 	}
 
@@ -185,10 +167,9 @@ func Mean(x []float64) (float64, bool) {
 	return sum / nf, true
 }
 
-// stdev estimates the sample standard deviation of array x
+// Stdev estimates the sample standard deviation of array x
 func Stdev(x []float64) (float64, bool) {
 	if len(x) < 2 {
-		fmt.Printf("stdev: Length too short\n")
 		return math.NaN(), false
 	}
 
@@ -196,7 +177,6 @@ func Stdev(x []float64) (float64, bool) {
 	xbar, xbarValid := Mean(x)
 
 	if !xbarValid {
-		fmt.Printf("stdev: Error calculating xbar\n")
 		return math.NaN(), false
 	}
 
@@ -209,54 +189,73 @@ func Stdev(x []float64) (float64, bool) {
 	return math.Pow(sumsq/(nf-1), 0.5), true
 }
 
-// radians converts angle from degrees, and returns its value in radians
+// Radians converts angle from degrees, and returns its value in radians
 func Radians(angle float64) float64 {
 	return angle * math.Pi / 180.0
 }
 
-// degrees converts angle from radians, and returns its value in degrees
+// Degrees converts angle from radians, and returns its value in degrees
 func Degrees(angle float64) float64 {
 	return angle * 180.0 / math.Pi
 }
 
-// radiansRel converts angle from degrees, and returns its value in radians in the range -Pi to + Pi
+// RadiansRel converts angle from degrees, and returns its value in radians in the range -Pi to +Pi
 func RadiansRel(angle float64) float64 {
-	for angle > 180 {
-		angle -= 360
+	if math.IsNaN(angle) || math.IsInf(angle, 0) {
+		return math.NaN()
 	}
-	for angle < -180 {
-		angle += 360
+	angle = math.Mod(angle, 360.0)
+	if angle > 180.0 {
+		angle -= 360.0
+	} else if angle < -180.0 {
+		angle += 360.0
 	}
 	return angle * math.Pi / 180.0
 }
 
-// degreesRel converts angle from radians, and returns its value in the range of -180 to +180 degrees
+// DegreesRel converts angle from radians, and returns its value in the range of -180 to +180 degrees
 func DegreesRel(angle float64) float64 {
-	for angle > math.Pi {
+	if math.IsNaN(angle) || math.IsInf(angle, 0) {
+		return math.NaN()
+	}
+	angle = math.Mod(angle, 2*math.Pi)
+	if angle > math.Pi {
 		angle -= 2 * math.Pi
-	}
-	for angle < -math.Pi {
+	} else if angle < -math.Pi {
 		angle += 2 * math.Pi
 	}
 	return angle * 180.0 / math.Pi
 }
 
-// degreesHdg converts angle from radians, and returns its value in the range of 0+ to 360 degrees
+// DegreesHdg converts angle from radians, and returns its value in the range of 0 to 360 degrees
 func DegreesHdg(angle float64) float64 {
-	for angle < 0 {
+	if math.IsNaN(angle) || math.IsInf(angle, 0) {
+		return math.NaN()
+	}
+	angle = math.Mod(angle, 2*math.Pi)
+	if angle < 0 {
 		angle += 2 * math.Pi
 	}
-	return angle * 180.0 / math.Pi
+	deg := angle * 180.0 / math.Pi
+	if deg >= 360.0 {
+		deg = 0.0
+	}
+	return deg
 }
 
-// roundToInt16 cheaply rounds a float64 to an int16, rather than truncating
+// RoundToInt16 rounds a float64 to an int16, returning 0 on NaN and clamping to [math.MinInt16, math.MaxInt16].
 func RoundToInt16(in float64) (out int16) {
-	if in >= 0 {
-		out = int16(in + 0.5)
-	} else {
-		out = int16(in - 0.5)
+	if math.IsNaN(in) {
+		return 0
 	}
-	return
+	rounded := math.Round(in)
+	if rounded >= float64(math.MaxInt16) {
+		return math.MaxInt16
+	}
+	if rounded <= float64(math.MinInt16) {
+		return math.MinInt16
+	}
+	return int16(rounded)
 }
 
 /*
@@ -265,11 +264,10 @@ Simple calculations and "good enough" on small scale (± 1° of lat / lon)
 suitable for relative distance to nearby traffic
 */
 
-// distRect returns distance and bearing to target #2 (e.g. traffic) from target #1 (e.g. ownship)
+// DistRect returns distance and bearing to target #2 (e.g. traffic) from target #1 (e.g. ownship)
 // Inputs are lat / lon of both points in decimal degrees
 // Outputs are distance in meters and bearing in degrees (0° = north, 90° = east)
 // Secondary outputs are north and east components of distance in meters (north, east positive)
-
 func DistRect(lat1, lon1, lat2, lon2 float64) (dist, bearing, distN, distE float64) {
 	radius_earth := 6371008.8 // meters; mean radius
 	dLat := RadiansRel(lat2 - lat1)
@@ -283,73 +281,49 @@ func DistRect(lat1, lon1, lat2, lon2 float64) (dist, bearing, distN, distE float
 	return
 }
 
-// distRectNorth returns north-south distance from point 1 to point 2.
-// Inputs are lat in decimal degrees. Output is distance in meters (east positive)
-func DistRectNorth(lat1, lat2 float64) float64 {
-	var dist float64
-	radius_earth := 6371008.8 // meters; mean radius
-	dLat := RadiansRel(lat2 - lat1)
-	dist = dLat * radius_earth
-	return dist
-}
-
-// distRectEast returns east-west distance from point 1 to point 2.
-// Inputs are lat/lon in decimal degrees. Output is distance in meters (north positive)
-func DistRectEast(lat1, lon1, lat2, lon2 float64) float64 {
-	var dist float64
-	radius_earth := 6371008.8 // meters; mean radius
-	//dLat := radiansRel(lat2 - lat1) // unused
-	avgLat := RadiansRel((lat2 + lat1) / 2)
-	dLon := RadiansRel(lon2 - lon1)
-	dist = dLon * radius_earth * math.Abs(math.Cos(avgLat))
-	return dist
-}
-
 /*
 Distance functions: Polar coordinate systems
 More accurate over longer distances
 */
 
-// distance calculates distance between two points using the law of cosines.
-// Inputs are lat / lon of both points in decimal degrees
-// Outputs are distance in meters and bearing to the target from origin in degrees (0° = north, 90° = east)
+// Distance calculates great-circle distance between two points using the haversine formula.
+// Inputs are lat / lon of both points in decimal degrees.
+// Outputs are distance in meters and initial bearing to the target from origin in degrees (0° = north, 90° = east).
 func Distance(lat1, lon1, lat2, lon2 float64) (dist, bearing float64) {
-	radius_earth := 6371008.8 // meters; mean radius
+	const radiusEarth = 6371008.8 // meters; mean radius
 
 	lat1 = Radians(lat1)
 	lon1 = Radians(lon1)
 	lat2 = Radians(lat2)
 	lon2 = Radians(lon2)
 
-	dist = math.Acos(math.Sin(lat1)*math.Sin(lat2)+math.Cos(lat1)*math.Cos(lat2)*math.Cos(lon2-lon1)) * radius_earth
+	dLat := lat2 - lat1
+	dLon := lon2 - lon1
+	sinHalfLat := math.Sin(dLat / 2)
+	sinHalfLon := math.Sin(dLon / 2)
+	a := sinHalfLat*sinHalfLat + math.Cos(lat1)*math.Cos(lat2)*sinHalfLon*sinHalfLon
+	if a < 0 {
+		a = 0
+	} else if a > 1 {
+		a = 1
+	}
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	dist = radiusEarth * c
 
-	var x, y float64
-
-	x = math.Cos(lat1)*math.Sin(lat2) - math.Sin(lat1)*math.Cos(lat2)*math.Cos(lon2-lon1)
-	y = math.Sin(lon2-lon1) * math.Cos(lat2)
+	x := math.Cos(lat1)*math.Sin(lat2) - math.Sin(lat1)*math.Cos(lat2)*math.Cos(dLon)
+	y := math.Sin(dLon) * math.Cos(lat2)
 
 	bearing = DegreesHdg(math.Atan2(y, x))
 
 	return
 }
 
-// CalcAltitude determines the pressure altitude (feet) from the atmospheric pressure (hPa)
+// CalcAltitude determines the pressure altitude (feet) from the atmospheric pressure (hPa).
+// Returns 0 if press is non-positive, NaN, or infinite.
 func CalcAltitude(press float64, altoffset int) (altitude float64) {
-	altitude = 145366.45 * (1.0 - math.Pow(press/1013.25, 0.190284)) + float64(altoffset)
+	if press <= 0 || math.IsNaN(press) || math.IsInf(press, 0) {
+		return 0
+	}
+	altitude = 145366.45*(1.0-math.Pow(press/1013.25, 0.190284)) + float64(altoffset)
 	return
-}
-
-// golang only defines min/max for float64. Really.
-func IMin(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
-}
-
-func IMax(x, y int) int {
-	if x > y {
-		return x
-	}
-	return y
 }

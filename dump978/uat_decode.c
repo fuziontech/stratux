@@ -135,7 +135,7 @@ static void uat_decode_sv(uint8_t *frame, struct uat_adsb_mdb *mdb)
             int raw_gs, raw_track;
 
             raw_gs = ((frame[12] & 0x1f) << 6) | ((frame[13] & 0xfc) >> 2);
-            if (raw_gs != 0) {
+            if ((raw_gs & 0x3ff) != 0) {
                 mdb->speed_valid = 1;
                 mdb->speed = ((raw_gs & 0x3ff) - 1);
             }
@@ -151,7 +151,7 @@ static void uat_decode_sv(uint8_t *frame, struct uat_adsb_mdb *mdb)
                 mdb->track = (raw_track & 0x1ff) * 360 / 512;
 
             mdb->dimensions_valid = 1;
-            mdb->length = 15 + 10 * ((frame[15] & 0x38) >> 3);
+            mdb->length = 15 + 10 * ((frame[15] & 0x70) >> 4);
             mdb->width = dimensions_widths[(frame[15] & 0x78) >> 3];
             mdb->position_offset = (frame[15] & 0x04) ? 1 : 0;
         }
@@ -548,7 +548,7 @@ static void uat_decode_info_frame(struct uat_uplink_info_frame *frame)
         frame->fisb.day = ((frame->data[2] & 0x07) << 2) | (frame->data[3] >> 6);
         frame->fisb.hours = (frame->data[3] & 0x3e) >> 1;
         frame->fisb.minutes = ((frame->data[3] & 0x01) << 5) | (frame->data[4] >> 3);
-        frame->fisb.seconds = ((frame->data[4] & 0x03) << 3) | (frame->data[5] >> 5);
+        frame->fisb.seconds = ((frame->data[4] & 0x07) << 3) | (frame->data[5] >> 5);
         frame->fisb.length = frame->length - 6;
         frame->fisb.data = frame->data + 6;
         break;
@@ -564,6 +564,7 @@ static void uat_decode_info_frame(struct uat_uplink_info_frame *frame)
 
 void uat_decode_uplink_mdb(uint8_t *frame, struct uat_uplink_mdb *mdb)
 {
+    memset(mdb, 0, sizeof(*mdb));
     mdb->position_valid = (frame[5] & 0x01) ? 1 : 0;
 
     /* Even with position_valid = 0, there seems to be plausible data here.
@@ -648,16 +649,21 @@ static void display_generic_data(uint8_t *data, uint16_t length, FILE *to)
 // The odd two-string-literals here is to avoid \0x3ABCDEF being interpreted as a single (very large valued) character
 static const char *dlac_alphabet = "\x03" "ABCDEFGHIJKLMNOPQRSTUVWXYZ\x1A\t\x1E\n| !\"#$%&'()*+,-./0123456789:;<=>?";
 
-static const char *decode_dlac(uint8_t *data, unsigned bytelen)
+static void decode_dlac(uint8_t *data, unsigned bytelen, char *out, size_t out_size)
 {
-    static char buf[1024];
     uint8_t *end = data + bytelen;
-    char *p = buf;
+    char *p = out;
+    char *out_end;
     int step = 0;
     int tab = 0;
+
+    if (!out || out_size == 0)
+        return;
+
+    out_end = out + out_size - 1;
     
-    while (data < end) {
-        int ch;
+    while (data < end && p < out_end) {
+        int ch = 0;
 
         assert(step >= 0 && step <= 3);
         switch (step) {
@@ -679,8 +685,10 @@ static const char *decode_dlac(uint8_t *data, unsigned bytelen)
         }
 
         if (tab) {
-            while (ch > 0)
-                *p++ = ' ', ch--;
+            while (ch > 0 && p < out_end) {
+                *p++ = ' ';
+                ch--;
+            }
             tab = 0;
         } else if (ch == 28) { // tab
             tab = 1;
@@ -691,8 +699,7 @@ static const char *decode_dlac(uint8_t *data, unsigned bytelen)
         step = (step+1)%4;
     }
 
-    *p = 0;
-    return buf;
+    *p = '\0';
 }
     
 static const char *get_fisb_product_name(uint16_t product_id)
@@ -822,23 +829,32 @@ static void uat_display_fisb_frame(const struct fisb_apdu *apdu, FILE *to)
     case 413:
         {
             // Generic text, DLAC
-            const char *text = decode_dlac(apdu->data, apdu->length);
+            char text[4096];
             const char *report = text;
+            decode_dlac(apdu->data, apdu->length, text, sizeof(text));
             
             while (report) {
                 char report_buf[1024];
                 const char *next_report;
+                size_t copy_len;
                 char *p, *r;
                 
                 next_report = strchr(report, '\x1e'); // RS
                 if (!next_report)
                     next_report = strchr(report, '\x03'); // ETX
                 if (next_report) {
-                    memcpy(report_buf, report, next_report - report);
-                    report_buf[next_report - report] = 0;
+                    copy_len = (size_t)(next_report - report);
+                    if (copy_len >= sizeof(report_buf))
+                        copy_len = sizeof(report_buf) - 1;
+                    memcpy(report_buf, report, copy_len);
+                    report_buf[copy_len] = '\0';
                     report = next_report + 1;
                 } else {
-                    strcpy(report_buf, report);
+                    copy_len = strlen(report);
+                    if (copy_len >= sizeof(report_buf))
+                        copy_len = sizeof(report_buf) - 1;
+                    memcpy(report_buf, report, copy_len);
+                    report_buf[copy_len] = '\0';
                     report = NULL;
                 }
                 

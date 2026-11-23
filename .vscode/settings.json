@@ -1,20 +1,23 @@
 {
     "go.useLanguageServer": true,
-    "go.lintFlags": [ "--disable-all" ],
     "go.toolsEnvVars": {
-        "CGO_CFLAGS_ALLOW": "-L${workspaceRoot}",
+        "CGO_CFLAGS_ALLOW": "-L${workspaceFolder}",
+        "LIBRARY_PATH": "${workspaceFolder}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}"
     },
     "go.buildOnSave": "off",
-    
+
     "terminal.integrated.env.linux": {
-        "CGO_CFLAGS_ALLOW": "-L${workspaceRoot}",
+        "CGO_CFLAGS_ALLOW": "-L${workspaceFolder}",
+        "LIBRARY_PATH": "${workspaceFolder}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}"
     },
 
     "[go]": {
         "editor.formatOnSave": false
     },
 
-    // Use this to make it possible to hide the gen_gdl90 vs fancontrol redeclaration errors..
+    // Use this to make it possible to hide the stratuxrun vs fancontrol redeclaration errors..
     "files.exclude": {
         "**/.git": true,
         "ogn/esp-idf/**": true,

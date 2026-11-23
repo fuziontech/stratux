@@ -2,6 +2,8 @@
 package sensors
 
 import (
+	"errors"
+
 	"github.com/kidoman/embd"
 	"github.com/stratux/goflying/mpu9250"
 )
@@ -11,6 +13,8 @@ const (
 	mpu9250AccelRange = 4   // mpu9250AccelRange is the default range to use for the Accel.
 	mpu9250UpdateFreq = 50  // mpu9250UpdateFreq is the rate at which to update the sensor values.
 )
+
+var errMPU9250Closed = errors.New("MPU9250 Error: sensor channel closed")
 
 // MPU9250 represents an InvenSense MPU9250 attached to the I2C bus and satisfies
 // the IMUReader interface.
@@ -43,6 +47,11 @@ func NewMPU9250(i2cbus *embd.I2CBus) (*MPU9250, error) {
 // Read returns the average (since last reading) time, Gyro X-Y-Z, Accel X-Y-Z, Mag X-Y-Z,
 // error reading Gyro/Accel, and error reading Mag.
 func (m *MPU9250) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GAError, MAGError error) {
+	if m == nil || m.mpu == nil {
+		GAError = errMPU9250Closed
+		MAGError = errMPU9250Closed
+		return
+	}
 	var (
 		data *mpu9250.MPUData
 		i    int8
@@ -50,7 +59,13 @@ func (m *MPU9250) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, G
 	data = new(mpu9250.MPUData)
 
 	for data.N == 0 && i < 5 {
-		data = <-m.mpu.CAvg
+		var ok bool
+		data, ok = <-m.mpu.CAvg
+		if !ok || data == nil {
+			GAError = errMPU9250Closed
+			MAGError = errMPU9250Closed
+			return
+		}
 		T = data.T.UnixNano()
 		G1 = data.G1
 		G2 = data.G2
@@ -71,12 +86,17 @@ func (m *MPU9250) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, G
 // ReadOne returns the most recent time, Gyro X-Y-Z, Accel X-Y-Z, Mag X-Y-Z,
 // error reading Gyro/Accel, and error reading Mag.
 func (m *MPU9250) ReadOne() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GAError, MAGError error) {
-	var (
-		data *mpu9250.MPUData
-	)
-	data = new(mpu9250.MPUData)
-
-	data = <-m.mpu.C
+	if m == nil || m.mpu == nil {
+		GAError = errMPU9250Closed
+		MAGError = errMPU9250Closed
+		return
+	}
+	data, ok := <-m.mpu.C
+	if !ok || data == nil {
+		GAError = errMPU9250Closed
+		MAGError = errMPU9250Closed
+		return
+	}
 	T = data.T.UnixNano()
 	G1 = data.G1
 	G2 = data.G2
@@ -94,5 +114,7 @@ func (m *MPU9250) ReadOne() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64
 
 // Close stops reading the MPU.
 func (m *MPU9250) Close() {
-	m.mpu.CloseMPU()
+	if m != nil && m.mpu != nil {
+		m.mpu.CloseMPU()
+	}
 }

@@ -150,15 +150,22 @@ void decode_nexrad(struct fisb_apdu *fisb)
     //   2    |        Block #            LSB |
     
 
+    if (fisb->length < 4)
+        return;
+
     int rle_flag = (fisb->data[0] & 0x80) != 0;
     int ns_flag = (fisb->data[0] & 0x40) != 0;
     int block_num = ((fisb->data[0] & 0x0f) << 16) | (fisb->data[1] << 8) | (fisb->data[2]);
     int scale_factor = (fisb->data[0] & 0x30) >> 4;
 
+    if (block_num > 607500)
+        return;
+
     // now decode the bins
     if (rle_flag) {
         // One bin, 128 values, RLE-encoded
         int i;
+        int bins = 0;
         double latN = 0, lonW = 0, latSize = 0, lonSize = 0;
         block_location(block_num, ns_flag, scale_factor, &latN, &lonW, &latSize, &lonSize);
 
@@ -176,18 +183,23 @@ void decode_nexrad(struct fisb_apdu *fisb)
         //   7   6   5   4   3   2   1   0
         // |   runlength - 1   | intensity |
 
-        for (i = 3; i < fisb->length; ++i) {
+        for (i = 3; i < fisb->length && bins < 128; ++i) {
             int intensity = fisb->data[i] & 7;
             int runlength = (fisb->data[i] >> 3) + 1;
 
-            while (runlength-- > 0)
+            while (runlength-- > 0 && bins < 128) {
                 fprintf(stdout, "%d", intensity);
+                ++bins;
+            }
         }
         fprintf(stdout, "\n");
     } else {
         int L = fisb->data[3] & 15;
         int i;
-        int row_start, row_offset, row_size;
+        int row_start, row_offset, row_size, step;
+
+        if (L == 0 || fisb->length < L + 3)
+            return;
 
         //
         // Empty block representation, representing one
@@ -211,13 +223,14 @@ void decode_nexrad(struct fisb_apdu *fisb)
         // a case of adding to the block number.
         
         // find the lowest-numbered block of this row
-        if (block_num >= 405000) {
-            row_start = block_num - ((block_num - 405000) % 225);
-            row_size = 225;
+        if (block_num >= BLOCK_THRESHOLD) {
+            block_num = block_num & ~1;
+            step = 2;
         } else {
-            row_start = block_num - (block_num % 450);
-            row_size = 450;
+            step = 1;
         }
+        row_size = BLOCKS_PER_RING;
+        row_start = block_num - (block_num % row_size);
         
         // find the offset of the first block in this row handled
         // by this message
@@ -236,7 +249,7 @@ void decode_nexrad(struct fisb_apdu *fisb)
                 if (bb & (1 << j)) {
                     // find the relevant block for this bit, limited
                     // to the same row as the original block.
-                    int row_x = (row_offset + 8*i + j - 3) % row_size;
+                    int row_x = (row_offset + (8*i + j - 3) * step) % row_size;
                     int bn = row_start + row_x;
                     double latN = 0, lonW = 0, latSize = 0, lonSize = 0;
                     int k;
@@ -269,6 +282,9 @@ void handle_frame(frame_type_t type, uint8_t *frame, int len, void *extra)
     if (type == UAT_UPLINK) {
         struct uat_uplink_mdb mdb;
         int i;
+
+        if (len != UPLINK_FRAME_DATA_BYTES)
+            return;
 
         uat_decode_uplink_mdb(frame, &mdb);
         if (!mdb.app_data_valid)

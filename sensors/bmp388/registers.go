@@ -2,7 +2,10 @@
 // The datasheet can be found here: https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp388-ds001.pdf
 package bmp388
 
-const Address byte = 0x76 // default I2C address
+const (
+	Address  byte = 0x76 // default I2C address
+	Address2 byte = 0x77 // secondary I2C address
+)
 
 const (
 	RegChipId  byte = 0x00 // useful for checking the connection
@@ -25,7 +28,7 @@ const (
 	PwrTemp   byte = 0x02 // power on temperature sensor
 	SoftReset byte = 0xB6 // command to reset all user configuration
 	DRDYPress byte = 0x20 // for checking if pressure data is ready
-	DRDYTemp  byte = 0x40 // for checking if pressure data is ready
+	DRDYTemp  byte = 0x40 // for checking if temperature data is ready
 )
 
 // The difference between forced and normal mode is the bmp388 goes to sleep after taking a measurement in forced mode.
@@ -33,7 +36,7 @@ const (
 // waking the sensor up when the sensor is in forced mode.
 const (
 	Normal Mode = 0x30
-	Forced Mode = 0x16
+	Forced Mode = 0x10
 	Sleep  Mode = 0x00
 )
 

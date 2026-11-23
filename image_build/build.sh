@@ -1,7 +1,9 @@
 #!/bin/bash -e
 # Script to configure and build Stratux images with pi-gen
 
-arch=`uname -m`
+cd "$(dirname "$0")"
+
+arch=$(uname -m)
 echo "arch ${arch}"
 
 # disable full image (stage 5), normal image (stage 4) and desktop image (stage 3)
@@ -20,15 +22,15 @@ rsync -av --delete stage2/10-stratux/ pi-gen/stage2/10-stratux/
 # so the files are visible to docker
 #
 # NOTE: This means local file changes will NOT be reflected in the image build
-local_git=`pwd`/../
-(cd pi-gen && rm -rf stratux && git clone ${local_git} stratux)
+local_git="$(pwd)/../"
+(cd pi-gen && rm -rf stratux && git clone "${local_git}" stratux)
 (cd pi-gen/stratux && git submodule update --init --recursive)
 # Build the stratux debian package.
-(cd pi-gen/stratux && make ddpkg)
-ERRCODE=$?
-if [ $ERRCODE -ne 0 ]; then
-	echo "Error creating the stratux debian package: Returned $ERRCODE"
-	exit $ERRCODE 
+ERRCODE=0
+(cd pi-gen/stratux && make ddpkg) || ERRCODE=$?
+if [ "$ERRCODE" -ne 0 ]; then
+	echo "Error creating the stratux debian package: Returned $ERRCODE" >&2
+	exit "$ERRCODE"
 fi
 
 # build via docker

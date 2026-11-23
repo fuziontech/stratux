@@ -50,11 +50,7 @@ modify_boot_cmdline()
 
 overlay_is_active()
 {
-    if [ -e /overlay/robase/overlay ] ; then
-        return 0
-    else
-        return 1
-    fi
+    [ "$(findmnt -n -o FSTYPE /)" = "overlay" ]
 }
 
 if [ $# -eq 0 ] ; then
@@ -91,34 +87,40 @@ case "$1" in
 
     enable)
         if [ -e "$overlay_disable_file" ] ; then
-            if [ -w "$overlay_base/overlay" ] ; then
-               rm "$overlay_disable_file"
+            if [ "$overlay_active" != "yes" ] || [ -w "${overlay_base}overlay" ] ; then
+                rm "$overlay_disable_file"
             else
-               mount -o remount,rw "$overlay_base"
-               rm "$overlay_disable_file"
-               mount -o remount,ro "$overlay_base"
+                mount -o remount,rw "$overlay_base"
+                rm "$overlay_disable_file"
+                mount -o remount,ro "$overlay_base"
             fi
         fi
         ;;
 
     disable)
         if [ ! -e "$overlay_disable_file" ] ; then
-            if [ -w "$overlay_base/overlay" ] ; then
-               echo 1 >"$overlay_disable_file"
+            if [ "$overlay_active" != "yes" ] || [ -w "${overlay_base}overlay" ] ; then
+                mkdir -p "${overlay_base}overlay"
+                echo 1 >"$overlay_disable_file"
             else
-               mount -o remount,rw "$overlay_base"
-               echo 1 >"$overlay_disable_file"
-               mount -o remount,ro "$overlay_base"
+                mount -o remount,rw "$overlay_base"
+                mkdir -p "${overlay_base}overlay"
+                echo 1 >"$overlay_disable_file"
+                mount -o remount,ro "$overlay_base"
             fi
         fi
         ;;
 
     lock)
-        mount -o remount,ro "$overlay_base"
+        if [ "$overlay_active" = "yes" ] ; then
+            mount -o remount,ro "$overlay_base"
+        fi
         ;;
 
     unlock)
-        mount -o remount,rw "$overlay_base"
+        if [ "$overlay_active" = "yes" ] ; then
+            mount -o remount,rw "$overlay_base"
+        fi
         ;;
 
     install)

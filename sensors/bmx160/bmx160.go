@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/kidoman/embd"
@@ -76,7 +77,12 @@ type BMX160 struct {
 	C                     <-chan *BMX160Data // Current instantaneous sensor values
 	CAvg                  <-chan *BMX160Data // Average sensor values (since CAvg last read)
 	CBuf                  <-chan *BMX160Data // Buffer of instantaneous sensor values
-	cClose                chan bool          // Turn off sensor polling
+	cC                    chan *BMX160Data
+	cAvg                  chan *BMX160Data
+	cBuf                  chan *BMX160Data
+	cClose                chan struct{} // Turn off sensor polling
+	wg                    sync.WaitGroup
+	closeOnce             sync.Once
 }
 
 /*
@@ -93,15 +99,14 @@ func NewBMX160(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRat
 	dev.enableMag = enableMag
 
 	id, err := dev.GetChipID()
-	if id != 0xd8 {
+	if err != nil {
+		return nil, err
+	}
+	if id != BMI160_CHIP_ID {
 		log.Printf("chip is not BMX160! Chip ID is %x\n", id)
 		return nil, errors.New("chip is not BMX160!")
 	}
 	log.Printf("found IMU chip BMX160!\n")
-
-	if id != BMI160_CHIP_ID {
-		return nil, errors.New("IMU is not BMX160")
-	}
 
 	//selftest of the IMU
 	//Testing the accelerometer
@@ -233,7 +238,7 @@ func NewBMX160(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRat
 	}
 
 	if err := dev.SetGyroSensitivity(sensitivityGyro); err != nil {
-		log.Println(err)
+		return nil, err
 	}
 
 	//configuring accelerometer
@@ -242,7 +247,7 @@ func NewBMX160(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRat
 	}
 
 	if err := dev.SetAccelSensitivity(sensitivityAccel); err != nil {
-		log.Println(err)
+		return nil, err
 	}
 
 	//Turning FIFO off
@@ -387,10 +392,10 @@ func NewBMX160(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRat
 		*/
 
 		/* Chip ID of the sensor is read */
-		var chipID byte
 		if err := dev.bmm150GetRegs(BMM150_CHIP_ID_ADDR, regData); err != nil {
 			return nil, errors.New("BMX160 Error: Couldn't retrieve magnetometer read register")
 		}
+		chipID := regData[0]
 		fmt.Printf("bmm chip id %x\n", chipID)
 
 		/* Function to update trim values */
@@ -466,6 +471,15 @@ func NewBMX160(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRat
 		log.Printf("magnetic sensor setup complete\n")
 	} //done with the magnetic sensor
 
+	dev.cC = make(chan *BMX160Data)
+	dev.C = dev.cC
+	dev.cAvg = make(chan *BMX160Data)
+	dev.CAvg = dev.cAvg
+	dev.cBuf = make(chan *BMX160Data, bufSize)
+	dev.CBuf = dev.cBuf
+	dev.cClose = make(chan struct{})
+
+	dev.wg.Add(1)
 	go dev.readSensors()
 
 	// Give the IMU time to fully initialize and then clear out any bad values from the averages.
@@ -478,6 +492,11 @@ func NewBMX160(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRat
 // readSensors polls the gyro, accelerometer and magnetometer sensors as well as the die temperature.
 // Communication is via channels.
 func (dev *BMX160) readSensors() {
+	defer dev.wg.Done()
+	defer close(dev.cC)
+	defer close(dev.cAvg)
+	defer close(dev.cBuf)
+
 	var (
 		g1, g2, g3, a1, a2, a3, m1, m2, m3, tmp   int16   // Current values
 		avg1, avg2, avg3, ava1, ava2, ava3, avtmp float64 // Accumulators for averages
@@ -487,6 +506,7 @@ func (dev *BMX160) readSensors() {
 		t0, t, t0m, tm                            time.Time
 		magSampleRate                             int
 		curdata                                   *BMX160Data
+		outC                                      chan *BMX160Data
 	)
 
 	acRegMap := map[*int16]byte{
@@ -499,19 +519,15 @@ func (dev *BMX160) readSensors() {
 	//	&m1: BMI160_AUX_DATA_ADDR, &m2: BMI160_AUX_DATA_ADDR+0x02, &m3: BMI160_AUX_DATA_ADDR+0x04, &m4: BMI160_AUX_DATA_ADDR+0x06,
 	//}
 
-	cC := make(chan *BMX160Data)
-	defer close(cC)
-	dev.C = cC
-	cAvg := make(chan *BMX160Data)
-	defer close(cAvg)
-	dev.CAvg = cAvg
-	cBuf := make(chan *BMX160Data, bufSize)
-	defer close(cBuf)
-	dev.CBuf = cBuf
-	dev.cClose = make(chan bool)
-	defer close(dev.cClose)
-
-	clock := time.NewTicker(time.Duration(int(10000.0/float32(dev.sampleRate)+0.5)) * time.Millisecond)
+	sampleRate := dev.sampleRate
+	if sampleRate <= 0 {
+		sampleRate = 200
+	}
+	pollInterval := time.Duration(int(1000.0/float32(sampleRate)+0.5)) * time.Millisecond
+	if pollInterval < time.Millisecond {
+		pollInterval = time.Millisecond
+	}
+	clock := time.NewTicker(pollInterval)
 	//TODO westphae: use the clock to record actual time instead of a timer
 	defer clock.Stop()
 
@@ -596,31 +612,43 @@ func (dev *BMX160) readSensors() {
 	for {
 		select {
 		case t = <-clock.C: // Read accel/gyro data:
+			gaError = nil
 			for p, reg := range acRegMap {
-				*p, gaError = dev.i2cRead2(reg)
-				if gaError != nil {
+				val, readErr := dev.i2cRead2(reg)
+				if readErr != nil {
 					log.Println("BMX160 Warning: error reading gyro/accel")
+					if gaError == nil {
+						gaError = readErr
+					}
+				} else {
+					*p = val
 				}
 			}
 
 			curdata = makeData()
-			// Update accumulated values and increment count of gyro/accel readings
-			avg1 += float64(g1)
-			avg2 += float64(g2)
-			avg3 += float64(g3)
-			ava1 += float64(a1)
-			ava2 += float64(a2)
-			ava3 += float64(a3)
-			avtmp += float64(tmp)
-			avm1 += int32(m1)
-			avm2 += int32(m2)
-			avm3 += int32(m3)
-			n++
+			outC = dev.cC
+			if gaError == nil {
+				// Update accumulated values and increment count of gyro/accel readings
+				avg1 += float64(g1)
+				avg2 += float64(g2)
+				avg3 += float64(g3)
+				ava1 += float64(a1)
+				ava2 += float64(a2)
+				ava3 += float64(a3)
+				avtmp += float64(tmp)
+				n++
+			}
 			select {
-			case cBuf <- curdata: // We update the buffer every time we read a new value.
+			case dev.cBuf <- curdata: // We update the buffer every time we read a new value.
 			default: // If buffer is full, remove oldest value and put in newest.
-				<-cBuf
-				cBuf <- curdata
+				select {
+				case <-dev.cBuf:
+				default:
+				}
+				select {
+				case dev.cBuf <- curdata:
+				default:
+				}
 			}
 		case tm = <-clockMagC: // Read magnetometer data:
 			//Below has not been adapted for the BMX 160 and thus doesn't work for the BMX160
@@ -636,8 +664,8 @@ func (dev *BMX160) readSensors() {
 				avm3 += int32(m3)
 				nm++
 			}
-		case cC <- curdata: // Send the latest values
-		case cAvg <- makeAvgData(): // Send the averages
+		case outC <- curdata: // Send the latest values
+		case dev.cAvg <- makeAvgData(): // Send the averages
 			avg1, avg2, avg3 = 0, 0, 0
 			ava1, ava2, ava3 = 0, 0, 0
 			avm1, avm2, avm3 = 0, 0, 0
@@ -653,7 +681,12 @@ func (dev *BMX160) readSensors() {
 // Close stops the driver from reading the BMX160.
 // TODO westphae: need a way to start it going again!
 func (dev *BMX160) Close() {
-	dev.cClose <- true
+	dev.closeOnce.Do(func() {
+		if dev.cClose != nil {
+			close(dev.cClose)
+		}
+		dev.wg.Wait()
+	})
 }
 
 // SetSampleRate changes the sampling rate of the BMX160.
@@ -772,7 +805,7 @@ func (dev *BMX160) SetGyroSensitivity(sensitivityGyro int) (err error) {
 		sensGyro = BMI160_GYRO_RANGE_125_DPS
 		dev.scaleGyro = 125.0 / float64(math.MaxInt16)
 	default:
-		err = fmt.Errorf("BMX160 Error: %d is not a valid gyro sensitivity", sensitivityGyro)
+		return fmt.Errorf("BMX160 Error: %d is not a valid gyro sensitivity", sensitivityGyro)
 	}
 
 	if errWrite := dev.i2cWrite(BMI160_GYRO_RANGE_ADDR, sensGyro); errWrite != nil {
@@ -801,7 +834,7 @@ func (dev *BMX160) SetAccelSensitivity(sensitivityAccel int) (err error) {
 		sensAccel = BMI160_ACCEL_RANGE_2G
 		dev.scaleAccel = 2.0 / float64(math.MaxInt16)
 	default:
-		err = fmt.Errorf("BMX160 Error: %d is not a valid accel sensitivity", sensitivityAccel)
+		return fmt.Errorf("BMX160 Error: %d is not a valid accel sensitivity", sensitivityAccel)
 	}
 
 	if errWrite := dev.i2cWrite(BMI160_ACCEL_RANGE_ADDR, sensAccel); errWrite != nil {
@@ -875,7 +908,7 @@ func (dev *BMX160) i2cWrite(register, value byte) (err error) {
 func (dev *BMX160) i2cReadBytes(register byte, value []byte) (err error) {
 	errRead := (dev.i2cbus).ReadFromReg(BMI160_I2C_ADDR, register, value)
 	if errRead != nil {
-		err = fmt.Errorf("BMX160 Error reading from %X: %s", register, err)
+		err = fmt.Errorf("BMX160 Error reading from %X: %s", register, errRead)
 	}
 	return
 }
@@ -980,16 +1013,19 @@ func (dev *BMX160) bmm150SetRegs(register byte, data byte) (err error) {
 	//      }
 	//      time.Sleep(time.Millisecond) // wait for command to trickle through
 
-	if err := dev.i2cWrite(BMI160_AUX_IF_4_ADDR, register); err != nil {
-		return errors.New("BMX160 Error setting bmm150 register to write to")
+	if err := dev.i2cWrite(BMI160_AUX_IF_4_ADDR, data); err != nil {
+		return errors.New("BMX160 Error setting value to write into bmm150")
 	}
 	time.Sleep(10 * BMI160_AUX_COM_DELAY * time.Millisecond) // wait for command to trickle through
-	if err := dev.i2cWrite(BMI160_AUX_IF_3_ADDR, data); err != nil {
-		return errors.New("BMX160 Error setting value to write into bmm150")
+	if err := dev.i2cWrite(BMI160_AUX_IF_3_ADDR, register); err != nil {
+		return errors.New("BMX160 Error setting bmm150 register to write to")
 	}
 	time.Sleep(10 * BMI160_AUX_COM_DELAY * time.Millisecond) // wait for command to trickle through
 
 	stat, err := dev.i2cRead(BMI160_STATUS_ADDR)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("writing status %x\n", stat&0x04)
 
 	return nil

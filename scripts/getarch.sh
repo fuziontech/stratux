@@ -1,9 +1,16 @@
 #!/bin/bash
-ARCH=$(uname -m)
-if [ "$ARCH" == "x86_64" ]; then
-	ARCH="amd64"
-fi
-if [ "$ARCH" == "aarch64" ]; then
-	ARCH="arm64"
-fi
-echo $ARCH
+set -euo pipefail
+
+ARCH="$(uname -m)"
+case "${ARCH}" in
+	x86_64)
+		ARCH="amd64"
+		;;
+	aarch64)
+		ARCH="arm64"
+		;;
+	armv7l|armv6l)
+		ARCH="armhf"
+		;;
+esac
+echo "${ARCH}"

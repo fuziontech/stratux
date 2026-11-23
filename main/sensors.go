@@ -6,6 +6,8 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/stratux/stratux/sensors/bmp388"
@@ -39,11 +41,13 @@ const (
 
 var (
 	i2cbus           embd.I2CBus
+	sensorMu         sync.Mutex
 	myPressureReader sensors.PressureReader
 	myIMUReader      sensors.IMUReader
-	cal              chan (string)
+	cal              = make(chan string, 1)
+	analysisLoggerMu sync.Mutex
 	analysisLogger   *ahrs.AHRSLogger
-	ahrsCalibrating  bool
+	ahrsCalibrating  atomic.Bool
 	logMap           map[string]interface{}
 )
 
@@ -63,28 +67,64 @@ func initI2CSensors() {
 	go updateAHRSStatus()
 }
 
+func closePressureSensor() {
+	sensorMu.Lock()
+	reader := myPressureReader
+	myPressureReader = nil
+	globalStatus.BMPConnected = false
+	sensorMu.Unlock()
+	if reader != nil {
+		reader.Close()
+	}
+}
+
+func closeIMUSensor() {
+	sensorMu.Lock()
+	reader := myIMUReader
+	myIMUReader = nil
+	globalStatus.IMUConnected = false
+	sensorMu.Unlock()
+	if reader != nil {
+		reader.Close()
+	}
+}
+
+func closeAnalysisLogger() {
+	analysisLoggerMu.Lock()
+	if analysisLogger != nil {
+		analysisLogger.Close()
+		analysisLogger = nil
+	}
+	analysisLoggerMu.Unlock()
+}
+
 func pollSensors() {
 	timer := time.NewTicker(4 * time.Second)
+	defer timer.Stop()
 	for {
 		<-timer.C
 
-		// If it's not currently connected, try connecting to pressure sensor
+		// Pressure sensor lifecycle
 		if globalSettings.BMP_Sensor_Enabled && !globalStatus.BMPConnected {
-			globalStatus.BMPConnected = initPressureSensor() // I2C temperature and pressure altitude.
-			go tempAndPressureSender()
+			if initPressureSensor() {
+				globalStatus.BMPConnected = true
+				go tempAndPressureSender()
+			}
+		} else if !globalSettings.BMP_Sensor_Enabled && globalStatus.BMPConnected {
+			closePressureSensor()
 		}
 
-		// If it's not currently connected, try connecting to IMU
+		// IMU sensor lifecycle
 		if globalSettings.IMU_Sensor_Enabled && !globalStatus.IMUConnected {
 			globalStatus.IMUConnected = initIMU() // I2C accel/gyro/mag.
+		} else if !globalSettings.IMU_Sensor_Enabled && globalStatus.IMUConnected {
+			closeIMUSensor()
 		}
 	}
 }
 
 func initPressureSensor() (ok bool) {
-
 	v, err := i2cbus.ReadByteFromReg(0x76, PRESSURE_WHO_AM_I)
-
 	if err != nil {
 		v, err = i2cbus.ReadByteFromReg(0x77, PRESSURE_WHO_AM_I)
 	}
@@ -92,14 +132,18 @@ func initPressureSensor() (ok bool) {
 		log.Printf("BMP-388 detected")
 		bmp, err := sensors.NewBMP388(&i2cbus)
 		if err == nil {
+			sensorMu.Lock()
 			myPressureReader = bmp
+			sensorMu.Unlock()
 			return true
 		}
 	} else if err == nil {
 		log.Printf("using BMP-280")
 		bmp, err := sensors.NewBMP280(&i2cbus, 100*time.Millisecond)
 		if err == nil {
+			sensorMu.Lock()
 			myPressureReader = bmp
+			sensorMu.Unlock()
 			return true
 		}
 	} else {
@@ -111,7 +155,9 @@ func initPressureSensor() (ok bool) {
 	bmp58x, err := sensors.NewBMP5XX(&i2cbus)
 	if err == nil {
 		log.Printf("BMP-58x detected")
+		sensorMu.Lock()
 		myPressureReader = bmp58x
+		sensorMu.Unlock()
 		return true
 	}
 
@@ -133,24 +179,32 @@ func tempAndPressureSender() {
 	u := 5 / (5 + float32(dt)) // Use 5 sec decay time for rate of climb, slightly faster than typical VSI
 
 	timer := time.NewTicker(time.Duration(1000*dt) * time.Millisecond)
+	defer timer.Stop()
+
 	for globalSettings.BMP_Sensor_Enabled && globalStatus.BMPConnected {
 		<-timer.C
 
+		sensorMu.Lock()
+		reader := myPressureReader
+		sensorMu.Unlock()
+		if reader == nil {
+			globalStatus.BMPConnected = false
+			break
+		}
+
 		// Read temperature and pressure altitude.
-		temp, err = myPressureReader.Temperature()
+		temp, err = reader.Temperature()
 		if err != nil {
 			addSingleSystemErrorf("pressure-sensor-temp-read", "AHRS Error: Couldn't read temperature from sensor: %s", err)
 		}
-		press, err = myPressureReader.Pressure()
+		press, err = reader.Pressure()
 		if press == 0 || err != nil {
 			if err != nil {
 				addSingleSystemErrorf("pressure-sensor-pressure-read", "AHRS Error: Couldn't read pressure from sensor: %s", err)
 			}
 			failNum++
 			if failNum > numRetries {
-				//				log.Printf("AHRS Error: Couldn't read pressure from sensor %d times, closing BMP: %s", failNum, err)
-				myPressureReader.Close()
-				globalStatus.BMPConnected = false // Try reconnecting a little later
+				closePressureSensor() // Try reconnecting a little later
 				errStr := "Pressure is 0"
 				if err != nil {
 					errStr = err.Error()
@@ -160,16 +214,27 @@ func tempAndPressureSender() {
 			}
 			continue
 		}
+		failNum = 0
 
 		altitude = common.CalcAltitude(press, globalSettings.AltitudeOffset)
-		if altitude > 70000 || (isGPSValid() && mySituation.GPSAltitudeMSL != 0 && math.Abs(float64(mySituation.GPSAltitudeMSL)-altitude) > 5000) {
+		var gpsAltMSL float32
+		if isGPSValid() {
+			if mySituation.muGPS != nil {
+				mySituation.muGPS.Lock()
+				gpsAltMSL = mySituation.GPSAltitudeMSL
+				mySituation.muGPS.Unlock()
+			} else {
+				gpsAltMSL = mySituation.GPSAltitudeMSL
+			}
+		}
+		if altitude > 70000 || (gpsAltMSL != 0 && math.Abs(float64(gpsAltMSL)-altitude) > 5000) {
 			addSingleSystemErrorf("BaroBroken", "Barometric altitude %d' out of expected range. Ignoring. Pressure sensor potentially broken.", int32(altitude))
 			continue
 		}
 
 		// Update the Situation data.
 		mySituation.muBaro.Lock()
-		mySituation.BaroLastMeasurementTime = stratuxClock.Time
+		mySituation.BaroLastMeasurementTime = stratuxClock.GetTime()
 		mySituation.BaroTemperature = float32(temp)
 		mySituation.BaroPressureAltitude = float32(altitude)
 		if altLast < -2000 {
@@ -181,8 +246,10 @@ func tempAndPressureSender() {
 		mySituation.muBaro.Unlock()
 		altLast = altitude
 	}
-	//mySituation.BaroPressureAltitude = 99999
-	//mySituation.BaroVerticalSpeed = 99999
+
+	if !globalSettings.BMP_Sensor_Enabled && globalStatus.BMPConnected {
+		closePressureSensor()
+	}
 }
 
 func initIMU() (ok bool) {
@@ -204,7 +271,9 @@ func initIMU() (ok bool) {
 			log.Printf("Error initializing BMX160: %s\n", err.Error())
 			return false
 		}
+		sensorMu.Lock()
 		myIMUReader = imu
+		sensorMu.Unlock()
 		return true
 	case ICMREG_WHO_AM_I_VAL:
 		log.Println("ICM-20948 detected.")
@@ -213,7 +282,9 @@ func initIMU() (ok bool) {
 			log.Printf("Error initializing ICM-20948: %s\n", err.Error())
 			return false
 		}
+		sensorMu.Lock()
 		myIMUReader = imu
+		sensorMu.Unlock()
 		return true
 	}
 
@@ -233,7 +304,9 @@ func initIMU() (ok bool) {
 			log.Printf("Error initializing MPU: %s\n", err.Error())
 			return false
 		}
+		sensorMu.Lock()
 		myIMUReader = imu
+		sensorMu.Unlock()
 		return true
 	}
 
@@ -253,7 +326,6 @@ func sensorAttitudeSender() {
 
 	s := ahrs.NewSimpleAHRS()
 	m := ahrs.NewMeasurement()
-	cal = make(chan (string), 1)
 
 	// Set up loggers for analysis
 	ahrswebListener, err := ahrsweb.NewKalmanListener()
@@ -265,12 +337,12 @@ func sensorAttitudeSender() {
 
 	// Need a sampling freq faster than 10Hz
 	timer := time.NewTicker(50 * time.Millisecond) // ~20Hz update.
+	defer timer.Stop()
+
 	for {
 		// Set sensor gyro calibrations
 		if c, d := &globalSettings.C, &globalSettings.D; d[0]*d[0]+d[1]*d[1]+d[2]*d[2] > 0 {
 			s.SetCalibrations(c, d)
-			// log.Printf("AHRS Info: IMU Calibrations read from settings: accel %6f %6f %6f; gyro %6f %6f %6f\n",
-			//	c[0], c[1], c[2], d[0], d[1], d[2])
 		} else {
 			// Do an initial calibration
 			select { // Don't block if cal isn't receiving: only need one calibration in the queue at a time.
@@ -295,19 +367,27 @@ func sensorAttitudeSender() {
 		for globalSettings.IMU_Sensor_Enabled && globalStatus.IMUConnected {
 			<-timer.C
 
+			sensorMu.Lock()
+			imuReader := myIMUReader
+			sensorMu.Unlock()
+			if imuReader == nil {
+				globalStatus.IMUConnected = false
+				break
+			}
+
 			// Process calibration and level requests
 			select {
 			case action := <-cal:
 				log.Printf("AHRS Info: cal received action %s\n", action)
-				ahrsCalibrating = true
-				myIMUReader.Read() // Clear out the averages
+				ahrsCalibrating.Store(true)
+				imuReader.Read() // Clear out the averages
 				var (
 					nTries uint8
 					cc, dd float64
 				)
 				for (math.Abs(cc-1) > calCLimit || dd > calDLimit) && nTries < numRetries {
 					time.Sleep(1 * time.Second)
-					_, d1, d2, d3, c1, c2, c3, _, _, _, mpuError, _ := myIMUReader.Read()
+					_, d1, d2, d3, c1, c2, c3, _, _, _, mpuError, _ := imuReader.Read()
 					cc = math.Sqrt(c1*c1 + c2*c2 + c3*c3)
 					dd = math.Sqrt(d1*d1 + d2*d2 + d3*d3)
 					nTries++
@@ -332,15 +412,15 @@ func sensorAttitudeSender() {
 						saveSettings()
 					}
 				}
-				ahrsCalibrating = false
+				ahrsCalibrating.Store(false)
 				<-timer.C // Make sure we get data for the actual algorithm
 			default:
 			}
 
 			// Make the IMU sensor measurements.
-			t = stratuxClock.Time
+			t = stratuxClock.GetTime()
 			m.T = float64(t.UnixNano()/1000) / 1e6
-			_, m.B1, m.B2, m.B3, m.A1, m.A2, m.A3, m.M1, m.M2, m.M3, mpuError, magError = myIMUReader.Read()
+			_, m.B1, m.B2, m.B3, m.A1, m.A2, m.A3, m.M1, m.M2, m.M3, mpuError, magError = imuReader.Read()
 			m.SValid = mpuError == nil
 			m.MValid = magError == nil
 			if mpuError != nil {
@@ -349,8 +429,7 @@ func sensorAttitudeSender() {
 				if failNum > numRetries {
 					log.Printf("AHRS Gyro/Accel Error: failed to read %d times, restarting: %s\n",
 						failNum-1, mpuError)
-					myIMUReader.Close()
-					globalStatus.IMUConnected = false
+					closeIMUSensor()
 				}
 				continue
 			}
@@ -363,15 +442,25 @@ func sensorAttitudeSender() {
 			}
 
 			// Make the GPS measurements.
-			m.TW = float64(mySituation.GPSLastGroundTrackTime.UnixNano()/1000) / 1e6
 			m.WValid = isGPSGroundTrackValid()
+			mySituation.muGPS.Lock()
+			gpsLastGTTime := mySituation.GPSLastGroundTrackTime
+			gpsGroundSpeed := mySituation.GPSGroundSpeed
+			gpsTrueCourse := mySituation.GPSTrueCourse
+			gpsVertSpeed := mySituation.GPSVerticalSpeed
+			mySituation.muGPS.Unlock()
+
+			m.TW = float64(gpsLastGTTime.UnixNano()/1000) / 1e6
 			if m.WValid {
-				m.W1 = mySituation.GPSGroundSpeed * math.Sin(float64(mySituation.GPSTrueCourse)*ahrs.Deg)
-				m.W2 = mySituation.GPSGroundSpeed * math.Cos(float64(mySituation.GPSTrueCourse)*ahrs.Deg)
+				m.W1 = gpsGroundSpeed * math.Sin(float64(gpsTrueCourse)*ahrs.Deg)
+				m.W2 = gpsGroundSpeed * math.Cos(float64(gpsTrueCourse)*ahrs.Deg)
 				if globalSettings.BMP_Sensor_Enabled && globalStatus.BMPConnected {
-					m.W3 = float64(mySituation.BaroVerticalSpeed * 60 / 6076.12)
+					mySituation.muBaro.Lock()
+					baroVS := mySituation.BaroVerticalSpeed
+					mySituation.muBaro.Unlock()
+					m.W3 = float64(baroVS * 60 / 6076.12)
 				} else {
-					m.W3 = float64(mySituation.GPSVerticalSpeed) * 3600 / 6076.12
+					m.W3 = float64(gpsVertSpeed) * 3600 / 6076.12
 				}
 			}
 
@@ -431,6 +520,7 @@ func sensorAttitudeSender() {
 
 			// Log it to csv for later analysis.
 			if globalSettings.AHRSLog && du.NewDiskUsage("/").Usage() < 0.95 {
+				analysisLoggerMu.Lock()
 				if analysisLogger == nil {
 					analysisFilename := fmt.Sprintf("sensors_%s.csv", time.Now().Format("20060102_150405"))
 					logMap = s.GetLogMap()
@@ -442,14 +532,22 @@ func sensorAttitudeSender() {
 					updateExtraLogging()
 					analysisLogger.Log()
 				}
+				analysisLoggerMu.Unlock()
 			} else {
-				analysisLogger = nil
+				closeAnalysisLogger()
 			}
+		}
+
+		// Clean up when IMU is disabled or disconnected.
+		closeAnalysisLogger()
+		if !globalSettings.IMU_Sensor_Enabled && globalStatus.IMUConnected {
+			closeIMUSensor()
 		}
 	}
 }
 
 func updateExtraLogging() {
+	mySituation.muGPS.Lock()
 	logMap["GPSNACp"] = float64(mySituation.GPSNACp)
 	logMap["GPSTrueCourse"] = mySituation.GPSTrueCourse
 	logMap["GPSVerticalAccuracy"] = mySituation.GPSVerticalAccuracy
@@ -464,35 +562,61 @@ func updateExtraLogging() {
 	logMap["GPSLastFixTimeSinceMidnight"] = float64(mySituation.GPSLastFixSinceMidnightUTC)
 	logMap["GPSAltitudeMSL"] = mySituation.GPSAltitudeMSL
 	logMap["GPSFixQuality"] = float64(mySituation.GPSFixQuality)
+	mySituation.muGPS.Unlock()
+
+	mySituation.muBaro.Lock()
 	logMap["BaroPressureAltitude"] = float64(mySituation.BaroPressureAltitude)
 	logMap["BaroVerticalSpeed"] = float64(mySituation.BaroVerticalSpeed)
+	mySituation.muBaro.Unlock()
 }
 
 func makeOrientationQuaternion(g [3]float64) (f *[4]float64) {
-	if globalSettings.IMUMapping[0] == 0 { // if unset, default to some standard orientation
-		globalSettings.IMUMapping[0] = -1 // +2 for RY836AI
+	f = &[4]float64{1, 0, 0, 0}
+
+	mapping := globalSettings.IMUMapping[0]
+	if mapping == 0 || mapping < -3 || mapping > 3 {
+		if mapping != 0 {
+			log.Printf("AHRS Warning: invalid IMUMapping[0]=%d, defaulting to -1\n", mapping)
+		}
+		mapping = -1 // +2 for RY836AI
+		globalSettings.IMUMapping[0] = mapping
 	}
 
 	// This is the "forward direction" chosen during the orientation process.
-	var x *[3]float64 = new([3]float64)
-	if globalSettings.IMUMapping[0] < 0 {
-		x[-globalSettings.IMUMapping[0]-1] = -1
+	x := new([3]float64)
+	if mapping < 0 {
+		x[-mapping-1] = -1
 	} else {
-		x[+globalSettings.IMUMapping[0]-1] = +1
+		x[+mapping-1] = +1
 	}
 
 	// Normalize the gravity vector to be 1 G.
-	z, _ := ahrs.MakeUnitVector(g)
+	z, err := ahrs.MakeUnitVector(g)
+	if err != nil || z == nil {
+		log.Printf("AHRS Error: MakeUnitVector failed for %v: %v\n", g, err)
+		return f
+	}
 
-	rotmat, _ := ahrs.MakeHardSoftRotationMatrix(*z, *x, [3]float64{0, 0, 1}, [3]float64{1, 0, 0})
-	f = new([4]float64)
+	rotmat, err := ahrs.MakeHardSoftRotationMatrix(*z, *x, [3]float64{0, 0, 1}, [3]float64{1, 0, 0})
+	if err != nil || rotmat == nil {
+		log.Printf("AHRS Error: MakeHardSoftRotationMatrix failed: %v\n", err)
+		return f
+	}
+
 	f[0], f[1], f[2], f[3] = ahrs.RotationMatrixToQuaternion(*rotmat)
-	return
+	return f
 }
 
 // This is used in the orientation process where the user specifies the forward and up directions.
 func getMinAccelDirection() (i int, err error) {
-	_, _, _, _, a1, a2, a3, _, _, _, err, _ := myIMUReader.ReadOne()
+	sensorMu.Lock()
+	reader := myIMUReader
+	sensorMu.Unlock()
+	if reader == nil {
+		return 0, fmt.Errorf("IMU not connected")
+	}
+
+	_, _, _, _, a1, a2, a3, _, _, _, err, _ := reader.ReadOne()
 	if err != nil {
 		return
 	}
@@ -525,28 +649,38 @@ func getMinAccelDirection() (i int, err error) {
 
 // CageAHRS sends a signal to the AHRSProvider that it should recalibrate and reset its level orientation.
 func CageAHRS() {
-	cal <- "level"
+	select {
+	case cal <- "level":
+	default:
+	}
 }
 
-// CageAHRS sends a signal to the AHRSProvider that it should recalibrate and reset its level orientation.
+// CalibrateAHRS sends a signal to the AHRSProvider that it should recalibrate gyros.
 func CalibrateAHRS() {
-	cal <- "cal"
+	select {
+	case cal <- "cal":
+	default:
+	}
 }
 
 // ResetAHRSGLoad resets the min and max to the current G load value.
 func ResetAHRSGLoad() {
+	if mySituation.muAttitude != nil {
+		mySituation.muAttitude.Lock()
+		defer mySituation.muAttitude.Unlock()
+	}
 	mySituation.AHRSGLoadMax = mySituation.AHRSGLoad
 	mySituation.AHRSGLoadMin = mySituation.AHRSGLoad
 }
 
 func updateAHRSStatus() {
 	var (
-		msg    uint8
-		imu    bool
-		ticker *time.Ticker
+		msg uint8
+		imu bool
 	)
 
-	ticker = time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		<-ticker.C
@@ -566,14 +700,23 @@ func updateAHRSStatus() {
 			msg += 1 << 2
 		}
 		// IMU is doing a calibration
-		if ahrsCalibrating {
+		if ahrsCalibrating.Load() {
 			msg += 1 << 3
 		}
 		// Logging to csv
-		if imu && analysisLogger != nil {
+		analysisLoggerMu.Lock()
+		loggingCSV := analysisLogger != nil
+		analysisLoggerMu.Unlock()
+		if imu && loggingCSV {
 			msg += 1 << 4
 		}
-		mySituation.AHRSStatus = msg
+		if mySituation.muAttitude != nil {
+			mySituation.muAttitude.Lock()
+			mySituation.AHRSStatus = msg
+			mySituation.muAttitude.Unlock()
+		} else {
+			mySituation.AHRSStatus = msg
+		}
 	}
 }
 

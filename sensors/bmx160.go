@@ -2,6 +2,8 @@
 package sensors
 
 import (
+	"errors"
+
 	"github.com/kidoman/embd"
 	"github.com/stratux/stratux/sensors/bmx160"
 )
@@ -11,6 +13,8 @@ const (
 	bmx160AccelRange = 4   // bmx160AccelRange is the default range to use for the Accel.
 	bmx160UpdateFreq = 200 // bmx160UpdateFreq is the rate at which to update the sensor values.
 )
+
+var errBMX160Closed = errors.New("BMX160 Error: sensor channel closed")
 
 // BMX160 is a Bosch BMX160 attached to the I2C bus and satisfies
 // the IMUReader interface.
@@ -32,11 +36,22 @@ func NewBMX160(i2cbus *embd.I2CBus) (*BMX160, error) {
 // Read returns the average (since last reading) time, Gyro X-Y-Z, Accel X-Y-Z, Mag X-Y-Z,
 // error reading Gyro/Accel, and error reading Mag.
 func (m *BMX160) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GAError, MAGError error) {
+	if m == nil || m.dev == nil {
+		GAError = errBMX160Closed
+		MAGError = errBMX160Closed
+		return
+	}
 	var i int8
 	data := new(bmx160.BMX160Data)
 
 	for data.N == 0 && i < 5 {
-		data = <-m.dev.CAvg
+		var ok bool
+		data, ok = <-m.dev.CAvg
+		if !ok || data == nil {
+			GAError = errBMX160Closed
+			MAGError = errBMX160Closed
+			return
+		}
 		T = data.T.UnixNano()
 		G1 = data.G1
 		G2 = data.G2
@@ -57,7 +72,17 @@ func (m *BMX160) Read() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GA
 // ReadOne returns the most recent time, Gyro X-Y-Z, Accel X-Y-Z, Mag X-Y-Z,
 // error reading Gyro/Accel, and error reading Mag.
 func (m *BMX160) ReadOne() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64, GAError, MAGError error) {
-	data := <-m.dev.C
+	if m == nil || m.dev == nil {
+		GAError = errBMX160Closed
+		MAGError = errBMX160Closed
+		return
+	}
+	data, ok := <-m.dev.C
+	if !ok || data == nil {
+		GAError = errBMX160Closed
+		MAGError = errBMX160Closed
+		return
+	}
 	T = data.T.UnixNano()
 	G1 = data.G1
 	G2 = data.G2
@@ -75,5 +100,7 @@ func (m *BMX160) ReadOne() (T int64, G1, G2, G3, A1, A2, A3, M1, M2, M3 float64,
 
 // Close stops reading the BMX160.
 func (m *BMX160) Close() {
-	m.dev.Close()
+	if m != nil && m.dev != nil {
+		m.dev.Close()
+	}
 }

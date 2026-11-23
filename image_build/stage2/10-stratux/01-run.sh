@@ -5,10 +5,10 @@
 #
 # xx-packages will install to the PI so its not appropriate for build required packages
 
-apt update
-
 on_chroot << EOF
-    apt install --yes dnsmasq ifplugd iptables
+    apt update
+    apt install --yes dnsmasq ifplugd iptables jq avahi-daemon curl minisign
+    systemctl enable avahi-daemon || true
 
     # try to reduce writing to SD card as much as possible, so they don't get
     # bricked when yanking the power cable
@@ -29,9 +29,12 @@ on_chroot << EOF
     # Run DHCP on eth0 when cable is plugged in
     sed -i -e 's/INTERFACES=""/INTERFACES="eth0"/g' /etc/default/ifplugd
 
-    # Generate ssh key for all installs. Otherwise it would have to be done on each boot, which takes a couple of seconds
-    ssh-keygen -A -v
-    systemctl disable regenerate_ssh_host_keys
+    # Do NOT bake shared SSH host private keys into release images.
+    # Remove any build-time host keys and keep regenerate_ssh_host_keys enabled
+    # so each device generates unique keys on first boot.
+    rm -f /etc/ssh/ssh_host_*
+    systemctl enable regenerate_ssh_host_keys || true
+
     # This is usually done by the console-setup service that takes quite long of first boot..
     /lib/console-setup/console-setup.sh
 
@@ -113,49 +116,70 @@ EOF
 
 # Prepare wiringpi for ogn trx via GPIO
 WIRINGPI_FILENAME="wiringpi_3.14_arm64.deb"
-wget https://github.com/WiringPi/WiringPi/releases/download/3.14/${WIRINGPI_FILENAME}
-
-# copy dpkg into /tmp directory so its available in the chroot
-WIRINGPI_FILENAME_TMP=${ROOTFS_DIR}/tmp/${WIRINGPI_FILENAME}
-(cp ${WIRINGPI_FILENAME} ${WIRINGPI_FILENAME_TMP})
+WIRINGPI_FILENAME_TMP="${ROOTFS_DIR}/tmp/${WIRINGPI_FILENAME}"
+wget -O "${WIRINGPI_FILENAME_TMP}" "https://github.com/WiringPi/WiringPi/releases/download/3.14/${WIRINGPI_FILENAME}"
 
 # install the package
 on_chroot << EOF
-    dpkg -i /tmp/${WIRINGPI_FILENAME}
+    dpkg -i "/tmp/${WIRINGPI_FILENAME}"
 EOF
 
 # remove the dpkg file from tmp
-rm ${WIRINGPI_FILENAME_TMP}
+rm -f "${WIRINGPI_FILENAME_TMP}"
 
 
-install files/bashrc.txt ${ROOTFS_DIR}/root/.bashrc
+install -m 644 files/bashrc.txt "${ROOTFS_DIR}/root/.bashrc"
 
 install -m 644 files/motd "${ROOTFS_DIR}/etc/motd"
 
 
-# network default config. TODO: can't we just implement gen_gdl90 -write_network_settings or something to generate them from template?
-install files/stratux-dnsmasq.conf ${ROOTFS_DIR}/etc/dnsmasq.d/stratux-dnsmasq.conf
+# network default config. TODO: can't we just implement stratuxrun -write-network-config or something to generate them from template?
+install -m 644 files/stratux-dnsmasq.conf "${ROOTFS_DIR}/etc/dnsmasq.d/stratux-dnsmasq.conf"
 
-install files/wpa_supplicant_ap.conf ${ROOTFS_DIR}/etc/wpa_supplicant/wpa_supplicant_ap.conf
-install files/interfaces ${ROOTFS_DIR}/etc/network/interfaces
+install -m 600 files/wpa_supplicant_ap.conf "${ROOTFS_DIR}/etc/wpa_supplicant/wpa_supplicant_ap.conf"
+install -m 644 files/interfaces "${ROOTFS_DIR}/etc/network/interfaces"
 
 # sshd config
-install files/sshd_config ${ROOTFS_DIR}/etc/ssh/sshd_config
+install -m 644 files/sshd_config "${ROOTFS_DIR}/etc/ssh/sshd_config"
+
+# Persist first-boot SSH host keys into the lower ext4 layer when overlay is active
+install -d -m 755 "${ROOTFS_DIR}/etc/systemd/system/regenerate_ssh_host_keys.service.d"
+cat << 'DROPIN_EOF' > "${ROOTFS_DIR}/etc/systemd/system/regenerate_ssh_host_keys.service.d/overlay.conf"
+[Service]
+ExecStartPost=/bin/sh -c 'if [ "$(findmnt -n -o FSTYPE /)" = "overlay" ]; then /sbin/overlayctl unlock && cp -a /etc/ssh/ssh_host_* /overlay/robase/etc/ssh/ && rm -f /overlay/robase/etc/systemd/system/multi-user.target.wants/regenerate_ssh_host_keys.service && sync && /sbin/overlayctl lock; fi'
+DROPIN_EOF
+chmod 644 "${ROOTFS_DIR}/etc/systemd/system/regenerate_ssh_host_keys.service.d/overlay.conf"
 
 # debug aliases
-install files/stxAliases.txt ${ROOTFS_DIR}/root/.stxAliases
+install -m 644 files/stxAliases.txt "${ROOTFS_DIR}/root/.stxAliases"
 
 # rtl-sdr setup
-install files/rtl-sdr-blacklist.conf ${ROOTFS_DIR}/etc/modprobe.d/
+install -m 644 files/rtl-sdr-blacklist.conf "${ROOTFS_DIR}/etc/modprobe.d/"
 
 # system tweaks
-install files/modules.txt ${ROOTFS_DIR}/etc/modules
+install -m 644 files/modules.txt "${ROOTFS_DIR}/etc/modules"
 
 # boot settings
-install files/config.txt ${ROOTFS_DIR}/boot/firmware/
+install -m 644 files/config.txt "${ROOTFS_DIR}/boot/firmware/"
+
+# Enable USB-C OTG peripheral mode (USB-NCM tethered EFB networking) on Pi 4 / Pi 5.
+# On Pi 4/5 the USB-C OTG port is on dwc2 while USB-A host ports remain on xHCI,
+# so USB-A SDR dongles and GPS receivers continue working normally. Pi 3 stays in host mode.
+if ! grep -q 'dr_mode=peripheral' "${ROOTFS_DIR}/boot/firmware/config.txt"; then
+    cat << 'USB_CFG_EOF' >> "${ROOTFS_DIR}/boot/firmware/config.txt"
+
+# USB-C tethered EFB networking (USB-NCM gadget) on Pi 4 / Pi 5 OTG port.
+# USB-A host ports remain on xHCI. Comment out to revert the USB-C port to host mode.
+[pi4]
+dtoverlay=dwc2,dr_mode=peripheral
+[pi5]
+dtoverlay=dwc2,dr_mode=peripheral
+[all]
+USB_CFG_EOF
+fi
 
 # rootfs overlay stuff
-install files/overlayctl files/init-overlay ${ROOTFS_DIR}/sbin/
+install -m 755 files/overlayctl files/init-overlay "${ROOTFS_DIR}/sbin/"
 
 on_chroot << EOF
     overlayctl install
@@ -165,13 +189,15 @@ on_chroot << EOF
 EOF
 
 # So we can import network settings if needed
-touch ${ROOTFS_DIR}/boot/firmware/.stratux-first-boot
+touch "${ROOTFS_DIR}/boot/firmware/.stratux-first-boot"
 
 # startup scripts
-install files/rc.local ${ROOTFS_DIR}/etc/rc.local
+install -m 755 files/rc.local "${ROOTFS_DIR}/etc/rc.local"
 
-# Optionally mount /dev/sda1 as /var/log - for logging to USB stick
-echo -e "\n/dev/sda1             /var/log        auto    defaults,nofail,noatime,x-systemd.device-timeout=1ms  0       2" >> ${ROOTFS_DIR}/etc/fstab
+# Optionally mount /dev/sda1 as /var/log - for logging to USB stick (idempotent)
+if ! grep -q '^/dev/sda1[[:space:]]\+/var/log[[:space:]]' "${ROOTFS_DIR}/etc/fstab"; then
+    printf '\n/dev/sda1             /var/log        auto    defaults,nofail,noatime,nodev,nosuid,noexec,x-systemd.device-timeout=2s  0       2\n' >> "${ROOTFS_DIR}/etc/fstab"
+fi
 
 # disable serial console, disable rfkill state restore, enable wifi on boot
 sed -i ${ROOTFS_DIR}/boot/firmware/cmdline.txt -e "s/console=serial0,[0-9]\+ /systemd.restore_state=0 rfkill.default_state=1 /"

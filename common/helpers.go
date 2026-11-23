@@ -1,8 +1,7 @@
 package common
 
-import "os/user"
+import "os"
 
 func IsRunningAsRoot() bool {
-    usr, _ := user.Current()
-    return usr.Username == "root"
+	return os.Geteuid() == 0
 }

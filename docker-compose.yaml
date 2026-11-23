@@ -4,7 +4,8 @@
 services:
   cli:
     image: stratux_debian
-    platform: linux/arm64/v8
+    platform: ${DOCKER_PLATFORM:-linux/arm64/v8}
+    working_dir: /data
     environment:
       GOCACHE: "/tmp/go-cache"
       GOMODCACHE: "/tmp/go/pkg/mod"

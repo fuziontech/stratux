@@ -43,15 +43,15 @@ static void handle_adsb_frame(uint64_t timestamp, uint8_t *frame, int rs);
 static void handle_uplink_frame(uint64_t timestamp, uint8_t *frame, int rs);
 
 #define SYNC_BITS (36)
-#define ADSB_SYNC_WORD 0xEACDDA4E2UL
-#define UPLINK_SYNC_WORD 0x153225B1DUL
+#define ADSB_SYNC_WORD UINT64_C(0xEACDDA4E2)
+#define UPLINK_SYNC_WORD UINT64_C(0x153225B1D)
 
 // relying on signed overflow is theoretically bad. Let's do it properly.
 
 #ifdef USE_SIGNED_OVERFLOW
 #define phi_difference(from, to) ((int16_t)((to) - (from)))
 #else
-inline int16_t phi_difference(uint16_t from, uint16_t to) {
+static inline int16_t phi_difference(uint16_t from, uint16_t to) {
   int32_t difference = to - from; // lies in the range -65535 .. +65535
   if (difference >= 32768)        //   +32768..+65535
     return difference - 65536;    //   -> -32768..-1: always in range
@@ -95,7 +95,8 @@ static void dump_raw_message(char updown, uint8_t *data, int len,
   fprintf(stdout, ";ss=%d", signal_strength);
   fprintf(stdout, ";\n");
 #else
-  userCB(updown, data, len, rs_errors, signal_strength);
+  if (userCB)
+    userCB(updown, data, len, rs_errors, signal_strength);
 #endif
 }
 
@@ -103,19 +104,23 @@ static void handle_adsb_frame(uint64_t timestamp, uint8_t *frame, int rs) {
   dump_raw_message('-', frame, (frame[0] >> 3) == 0 ? SHORT_FRAME_DATA_BYTES
                                                     : LONG_FRAME_DATA_BYTES,
                    rs);
+#ifndef BUILD_LIB
   fflush(stdout);
+#endif
 }
 
 static void handle_uplink_frame(uint64_t timestamp, uint8_t *frame, int rs) {
   dump_raw_message('+', frame, UPLINK_FRAME_DATA_BYTES, rs);
+#ifndef BUILD_LIB
   fflush(stdout);
+#endif
 }
 
 uint16_t iqphase[65536]; // contains value [0..65536) -> [0, 2*pi)
 
 uint16_t iqamplitude[65536]; // contains value [0..65536) -> [0, 1000*sqrt(2))
 
-void make_atan2_table(void) {
+static void make_atan2_table(void) {
   unsigned i, q;
   union {
     uint8_t iq[2];
@@ -164,6 +169,10 @@ static void convert_to_phi(uint16_t *dest, uint16_t *src, int n) {
 static void calc_power(uint16_t *samples, int len) { // sets signal_strength to scaled amplitude. 0 = no signal, 1000 = saturated receiver on all samples in measurement.
   long avg = 0;
   int n = len;
+  if (len <= 0) {
+    signal_strength = 0;
+    return;
+  }
   while (n--) {
     avg += iqamplitude[*samples++];
   }
@@ -171,8 +180,8 @@ static void calc_power(uint16_t *samples, int len) { // sets signal_strength to 
 }
 
 #ifndef BUILD_LIB
-void read_from_stdin(void) {
-  char buffer[65536 * 2];
+static void read_from_stdin(void) {
+  _Alignas(uint16_t) char buffer[65536 * 2];
   uint16_t phi[65536];
 
   int n;
@@ -187,19 +196,40 @@ void read_from_stdin(void) {
 
     used += n;
     processed = process_buffer(phi, (uint16_t *)buffer, used / 2, offset);
-    used -= processed * 2;
-    offset += processed;
-    if (used > 0) {
-      memmove(buffer, buffer + processed * 2, used);
-      memmove(phi, phi + processed, used);
+    if (processed > 0) {
+      used -= processed * 2;
+      offset += processed;
+      if (used > 0) {
+        memmove(buffer, buffer + processed * 2, used);
+        memmove(phi, phi + processed, (size_t)(used / 2) * sizeof(uint16_t));
+      }
     }
   }
 }
 #else
 // #define DEFAULT_SAMPLE_RATE       2048000
 // #define DEFAULT_BUF_LENGTH      (262144) 16*16384
-static char buffer[65536 * 2]; // 131072, max received should be 113120
+static _Alignas(uint16_t) char buffer[65536 * 2]; // 131072, max received should be 113120
 static uint16_t phi[65536];
+static uint64_t iq_total_samples = 0;
+static uint64_t iq_clipped_samples = 0;
+static uint64_t iq_abs_sum = 0;
+
+void dump978_get_iq_stats(uint64_t *total_samples, uint64_t *clipped_samples,
+                          uint64_t *abs_sum, int reset) {
+  if (total_samples)
+    *total_samples = iq_total_samples;
+  if (clipped_samples)
+    *clipped_samples = iq_clipped_samples;
+  if (abs_sum)
+    *abs_sum = iq_abs_sum;
+  if (reset) {
+    iq_total_samples = 0;
+    iq_clipped_samples = 0;
+    iq_abs_sum = 0;
+  }
+}
+
 int process_data(char *data, int dlen) {
   int n;
   int processed;
@@ -207,8 +237,28 @@ int process_data(char *data, int dlen) {
   static int used = 0;
   static uint64_t offset = 0;
 
+  if (!data || dlen <= 0)
+    return 0;
+
+  {
+    const uint8_t *raw = (const uint8_t *)data;
+    uint64_t clipped = 0;
+    uint64_t abs_sum = 0;
+    for (int i = 0; i < dlen; ++i) {
+      uint8_t v = raw[i];
+      if (v == 0 || v == 255) {
+        clipped++;
+      }
+      int diff = (int)v - 128;
+      abs_sum += (uint64_t)(diff < 0 ? -diff : diff);
+    }
+    iq_total_samples += (uint64_t)dlen;
+    iq_clipped_samples += clipped;
+    iq_abs_sum += abs_sum;
+  }
+
   while (dlen > 0) {
-    n = (sizeof(buffer) - used) >= dlen ? dlen : (sizeof(buffer) - used);
+    n = (int)(sizeof(buffer) - used) >= dlen ? dlen : (int)(sizeof(buffer) - used);
     memcpy(buffer + used, data + doffset, n);
 
     convert_to_phi(phi + used / 2, (uint16_t *)(buffer + (used & ~1)),
@@ -216,11 +266,13 @@ int process_data(char *data, int dlen) {
 
     used += n;
     processed = process_buffer(phi, (uint16_t *)buffer, used / 2, offset);
-    used -= processed * 2;
-    offset += processed;
-    if (used > 0) {
-      memmove(buffer, buffer + processed * 2, used);
-      memmove(phi, phi + processed, used);
+    if (processed > 0) {
+      used -= processed * 2;
+      offset += processed;
+      if (used > 0) {
+        memmove(buffer, buffer + processed * 2, used);
+        memmove(phi, phi + processed, (size_t)(used / 2) * sizeof(uint16_t));
+      }
     }
 
     doffset += n;
@@ -294,7 +346,7 @@ static inline int sync_word_fuzzy_compare(uint64_t word, uint64_t expected) {
 // that matches the sync word 'pattern'. Place the dphi
 // threshold to use for bit slicing in '*center'. Return 1
 // if the sync word is OK, 0 on failure
-int check_sync_word(uint16_t *phi, uint64_t pattern, int16_t *center) {
+static int check_sync_word(uint16_t *phi, uint64_t pattern, int16_t *center) {
   int i;
   int32_t dphi_zero_total = 0;
   int zero_bits = 0;
@@ -308,7 +360,7 @@ int check_sync_word(uint16_t *phi, uint64_t pattern, int16_t *center) {
   for (i = 0; i < SYNC_BITS; ++i) {
     int16_t dphi = phi_difference(phi[i * 2], phi[i * 2 + 1]);
 
-    if (pattern & (1UL << (35 - i))) {
+    if (pattern & (UINT64_C(1) << (35 - i))) {
       ++one_bits;
       dphi_one_total += dphi;
     } else {
@@ -327,7 +379,7 @@ int check_sync_word(uint16_t *phi, uint64_t pattern, int16_t *center) {
   for (i = 0; i < SYNC_BITS; ++i) {
     int16_t dphi = phi_difference(phi[i * 2], phi[i * 2 + 1]);
 
-    if (pattern & (1UL << (35 - i))) {
+    if (pattern & (UINT64_C(1) << (35 - i))) {
       if (dphi < *center)
         ++error_bits;
     } else {
@@ -342,9 +394,9 @@ int check_sync_word(uint16_t *phi, uint64_t pattern, int16_t *center) {
   return (error_bits <= MAX_SYNC_ERRORS);
 }
 
-#define SYNC_MASK ((((uint64_t)1) << SYNC_BITS) - 1)
+#define SYNC_MASK ((UINT64_C(1) << SYNC_BITS) - 1)
 
-int process_buffer(uint16_t *phi, uint16_t *raw, int len, uint64_t offset) {
+static int process_buffer(uint16_t *phi, uint16_t *raw, int len, uint64_t offset) {
   uint64_t sync0 = 0, sync1 = 0;
   int lenbits;
   int bit;
@@ -445,6 +497,8 @@ int process_buffer(uint16_t *phi, uint16_t *raw, int len, uint64_t offset) {
     }
   }
 
+  if (bit <= SYNC_BITS)
+    return 0;
   return (bit - SYNC_BITS) * 2;
 }
 

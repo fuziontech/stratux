@@ -1,14 +1,18 @@
 #!/bin/bash
+set -euo pipefail
+shopt -s nullglob
 
-mkdir -p tmp
-cd tmp
+out_dir="$(pwd)"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf -- "${tmpdir}"' EXIT
 
+cd "${tmpdir}"
 
-# OFM.. already mbtiles. THe tiles are already nicely aligned - existing tiles = filled tiles.
+# OFM.. already mbtiles. The tiles are already nicely aligned - existing tiles = filled tiles.
 # So we can just merge all DBs together
-AIRAC=2307
+AIRAC="${AIRAC:-2307}"
 for f in ebbu ed efin ehaa ekdk epww esaa lbsr ldzo lf lggg lhcc li ljla lkaa lovv lrbb lsas lzbb; do
-    wget https://snapshots.openflightmaps.org/live/${AIRAC}/tiles/${f}/noninteractive/epsg3857/${f}_256.mbtiles
+    wget "https://snapshots.openflightmaps.org/live/${AIRAC}/tiles/${f}/noninteractive/epsg3857/${f}_256.mbtiles"
 done
 
 sqlite3 out.db <<EOF
@@ -34,9 +38,8 @@ INSERT INTO metadata VALUES('maxzoom', '11');
 EOF
 
 for f in *.mbtiles; do
-    echo "Adding $f"
-    sqlite3 out.db "ATTACH DATABASE '$f' AS indb; INSERT OR IGNORE INTO tiles SELECT * FROM indb.tiles"
+    echo "Adding ${f}"
+    sqlite3 out.db "ATTACH DATABASE '${f}' AS indb; INSERT OR IGNORE INTO tiles SELECT * FROM indb.tiles"
 done
-mv out.db ../openflightmaps.mbtiles
-cd ..
-rm -r tmp
+
+mv -f -- out.db "${out_dir}/openflightmaps.mbtiles"

@@ -239,7 +239,7 @@ static int encode_imf(struct uat_adsb_mdb *mdb)
 
 static void send_altitude_only(struct uat_adsb_mdb *mdb)
 {
-    uint8_t esnt_frame[14];
+    uint8_t esnt_frame[14] = {0};
     int raw_alt;
 
     // Need barometric altitude, see if we have it
@@ -270,7 +270,7 @@ static void send_altitude_only(struct uat_adsb_mdb *mdb)
 
 static void maybe_send_surface_position(struct uat_adsb_mdb *mdb)
 {
-    uint8_t esnt_frame[14];
+    uint8_t esnt_frame[14] = {0};
 
     if (mdb->airground_state != AG_GROUND)
         return; // nope!
@@ -312,7 +312,7 @@ static void maybe_send_surface_position(struct uat_adsb_mdb *mdb)
 
 static void maybe_send_air_position(struct uat_adsb_mdb *mdb)
 {
-    uint8_t esnt_frame[14];
+    uint8_t esnt_frame[14] = {0};
     int raw_alt;
 
     if (mdb->airground_state != AG_SUPERSONIC && mdb->airground_state != AG_SUBSONIC)
@@ -365,7 +365,7 @@ static void maybe_send_air_position(struct uat_adsb_mdb *mdb)
 
 static void maybe_send_air_velocity(struct uat_adsb_mdb *mdb)
 {
-    uint8_t esnt_frame[14];
+    uint8_t esnt_frame[14] = {0};
     int supersonic;
 
     if (mdb->airground_state != AG_SUPERSONIC && mdb->airground_state != AG_SUBSONIC)
@@ -486,7 +486,7 @@ static unsigned encodeSquawk(char *squawkStr)
 
 static void maybe_send_callsign(struct uat_adsb_mdb *mdb)
 {
-    uint8_t esnt_frame[14];
+    uint8_t esnt_frame[14] = {0};
     int imf = encode_imf(mdb);
 
     // NB: we choose a CF value based on the address type (IMF value);
@@ -624,6 +624,15 @@ static void handle_frame(frame_type_t type, uint8_t *frame, int len, void *extra
 {
     if (type == UAT_DOWNLINK) {
         struct uat_adsb_mdb mdb;
+        if (len == SHORT_FRAME_DATA_BYTES) {
+            if ((frame[0] >> 3) != 0)
+                return;
+        } else if (len == LONG_FRAME_DATA_BYTES) {
+            if ((frame[0] >> 3) == 0)
+                return;
+        } else {
+            return;
+        }
         uat_decode_adsb_mdb(frame, &mdb);
         generate_esnt(&mdb);
     }

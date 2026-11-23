@@ -6,7 +6,7 @@
         {
             "label": "Build",
             "type": "shell",
-            "command": "make gen_gdl90 debug=true",
+            "command": "make stratuxrun debug=true",
             "problemMatcher": "$go",
             "group": {
                 "kind": "build",
@@ -20,7 +20,7 @@
             "problemMatcher": "$go",
             "group": {
                 "kind": "build",
-                "isDefault": true
+                "isDefault": false
             }
         }
     ]

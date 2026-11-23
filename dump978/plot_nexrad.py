@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 #
 # This takes the output of extract_nexrad and generates images.
@@ -107,7 +107,7 @@ for image in images.values():
     xsize = int(pixels_per_degree * 180.0 * (xmax - xmin) / math.pi)
     ysize = int(pixels_per_degree * 180.0 * (ymax - ymin) / math.pi)
 
-    print image['type'], image['time'], 'dimensions', xsize, ysize, 'layers', len(image['blocks'])
+    print(image['type'], image['time'], 'dimensions', xsize, ysize, 'layers', len(image['blocks']))
 
     surface = cairo.ImageSurface(cairo.FORMAT_RGB24, xsize, ysize)
     cc = cairo.Context(surface)
@@ -126,8 +126,8 @@ for image in images.values():
     
     for sf in sorted(image['blocks'].keys(), reverse=True): # lowest res first    
         for latN, lonW, latSize, lonSize, data in image['blocks'][sf]:
-            for y in xrange(4):
-                for x in xrange(32):
+            for y in range(4):
+                for x in range(32):
                     intensity = int(data[x+y*32])
                     lat = latN - y * latSize / 4.0
                     lon = lonW + x * lonSize / 32.0

@@ -86,6 +86,8 @@ static struct aircraft *find_or_create_aircraft(uint32_t address)
         return a;
 
     a = calloc(1, sizeof(*a));
+    if (!a)
+        return NULL;
     a->address = address;
     a->airground_state = AG_RESERVED;
 
@@ -129,6 +131,8 @@ static void process_mdb(struct uat_adsb_mdb *mdb)
     }
    
     a = find_or_create_aircraft(addr);
+    if (!a)
+        return;
     a->last_seen = NOW;
     ++a->messages;
     
@@ -163,10 +167,11 @@ static void process_mdb(struct uat_adsb_mdb *mdb)
         a->vert_rate = mdb->vert_rate;
     }
     
+    // Both callsign and squawk are stored in 9-byte buffers (8 chars + NUL); use bounded snprintf.
     if (mdb->callsign_type == CS_CALLSIGN)
-        strcpy(a->callsign, mdb->callsign);
+        snprintf(a->callsign, sizeof(a->callsign), "%s", mdb->callsign);
     else if (mdb->callsign_type == CS_SQUAWK)
-        strcpy(a->squawk, mdb->callsign);
+        snprintf(a->squawk, sizeof(a->squawk), "%s", mdb->callsign);
 
     if (mdb->sec_altitude_type != ALT_INVALID) {
         // only use secondary if no primary is available
@@ -180,15 +185,17 @@ static void process_mdb(struct uat_adsb_mdb *mdb)
 static int write_receiver_json(const char *dir)
 {
     char path[PATH_MAX];
+    char path_new[PATH_MAX];
     FILE *f;
 
-    if (snprintf(path, PATH_MAX, "%s/receiver.json.new", dir) >= PATH_MAX) {
+    if (snprintf(path, PATH_MAX, "%s/receiver.json", dir) >= PATH_MAX ||
+        snprintf(path_new, PATH_MAX, "%s/receiver.json.new", dir) >= PATH_MAX) {
         fprintf(stderr, "write_receiver_json: path too long\n");
         return 0;
     }
 
-    if (!(f = fopen(path, "w"))) {
-        fprintf(stderr, "fopen(%s): %m\n", path);
+    if (!(f = fopen(path_new, "w"))) {
+        fprintf(stderr, "fopen(%s): %m\n", path_new);
         return 0;
     }
 
@@ -199,6 +206,11 @@ static int write_receiver_json(const char *dir)
             "  \"history\" : 0\n"
             "}\n");
     fclose(f);
+
+    if (rename(path_new, path) < 0) {
+        fprintf(stderr, "rename(%s,%s): %m\n", path_new, path);
+        return 0;
+    }
 
     return 1;
 }
@@ -301,7 +313,6 @@ static void handle_frame(frame_type_t type, uint8_t *frame, int len, void *extra
     }
 
     uat_decode_adsb_mdb(frame, &mdb);
-    //uat_display_adsb_mdb(&mdb, stdout);    
     process_mdb(&mdb);
 }                                                        
 

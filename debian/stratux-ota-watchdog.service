@@ -1,0 +1,11 @@
+[Unit]
+Description=Stratux OTA Health-Check Watchdog and Auto-Rollback
+After=stratux.service
+Wants=stratux.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/stratux/bin/stratux-ota-watchdog.sh
+
+[Install]
+WantedBy=multi-user.target

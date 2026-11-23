@@ -1,0 +1,12 @@
+[Unit]
+Description=Stratux Pre-Start OTA Updater and First-Boot Setup
+After=local-fs.target
+Before=stratux.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/stratux/bin/stratux-pre-start.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

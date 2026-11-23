@@ -5,43 +5,55 @@
 	as part of this header.
 
 	Modifications (c) 2016 AvSquirrel (https://github.com/AvSquirrel)
-	monotonic.go: Create monotonic clock using time.Timer - necessary because of real time clock changes on RPi.
+	monotonic.go: Create monotonic clock using Go's monotonic time - necessary because of real time clock changes on RPi.
 */
 
 package main
 
 import (
-	humanize "github.com/dustin/go-humanize"
+	"sync"
 	"time"
+
+	humanize "github.com/dustin/go-humanize"
 )
 
 // Timer (since start).
 
 type monotonic struct {
-	Milliseconds uint64
-	Time         time.Time
-	ticker       *time.Ticker
-	realTimeSet  bool
-	RealTime     time.Time
+	startTime   time.Time
+	mu          sync.RWMutex
+	realTimeSet bool
+	realTimeRef time.Time
+	realTimeAt  time.Time
 }
 
-func (m *monotonic) Watcher() {
-	for {
-		<-m.ticker.C
-		m.Milliseconds += 10
-		m.Time = m.Time.Add(10 * time.Millisecond)
-		if m.realTimeSet {
-			m.RealTime = m.RealTime.Add(10 * time.Millisecond)
-		}
+func (m *monotonic) GetTime() time.Time {
+	return (time.Time{}).Add(time.Since(m.startTime))
+}
+
+func (m *monotonic) GetMilliseconds() uint64 {
+	ms := time.Since(m.startTime).Milliseconds()
+	if ms < 0 {
+		return 0
 	}
+	return uint64(ms)
+}
+
+func (m *monotonic) GetRealTime() time.Time {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.realTimeSet {
+		return time.Time{}
+	}
+	return m.realTimeRef.Add(time.Since(m.realTimeAt))
 }
 
 func (m *monotonic) Since(t time.Time) time.Duration {
-	return m.Time.Sub(t)
+	return m.GetTime().Sub(t)
 }
 
 func (m *monotonic) HumanizeTime(t time.Time) string {
-	return humanize.RelTime(t, m.Time, "ago", "from now")
+	return humanize.RelTime(t, m.GetTime(), "ago", "from now")
 }
 
 func (m *monotonic) Unix() int64 {
@@ -49,18 +61,23 @@ func (m *monotonic) Unix() int64 {
 }
 
 func (m *monotonic) HasRealTimeReference() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.realTimeSet
 }
 
 func (m *monotonic) SetRealTimeReference(t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if !m.realTimeSet { // Only allow the real clock to be set once.
-		m.RealTime = t
+		m.realTimeRef = t
+		m.realTimeAt = time.Now()
 		m.realTimeSet = true
 	}
 }
 
 func NewMonotonic() *monotonic {
-	t := &monotonic{Milliseconds: 0, Time: time.Time{}, ticker: time.NewTicker(10 * time.Millisecond)}
-	go t.Watcher()
-	return t
+	return &monotonic{
+		startTime: time.Now(),
+	}
 }

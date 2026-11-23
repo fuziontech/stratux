@@ -1,0 +1,16 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">Stratux (%h)</name>
+  <service>
+    <type>_http._tcp</type>
+    <port>80</port>
+    <txt-record>path=/</txt-record>
+    <txt-record>desc=Stratux Web UI</txt-record>
+  </service>
+  <service>
+    <type>_gdl90._udp</type>
+    <port>4000</port>
+    <txt-record>desc=Stratux GDL90</txt-record>
+  </service>
+</service-group>

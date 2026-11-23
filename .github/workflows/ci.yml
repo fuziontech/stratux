@@ -4,7 +4,7 @@ on:
   # Run on pull requests
   pull_request:
 
-  # and pushes to main
+  # and pushes to master
   push:
     branches:
       - master
@@ -12,16 +12,74 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # This workflow contains a single job called "build"
+  test:
+    name: Go, C, and Shell Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install native test dependencies
+        run: sudo apt-get update && sudo apt-get install -y librtlsdr-dev
+
+      - name: Build and test dump978
+        run: make -C dump978 all lib test
+
+      - name: Run go vet, replay regression tests, and standalone replay harness
+        id: replay-and-test
+        env:
+          LIBRARY_PATH: ${{ github.workspace }}
+          LD_LIBRARY_PATH: ${{ github.workspace }}
+          CGO_CFLAGS_ALLOW: -L${{ github.workspace }}
+        run: |
+          go vet ./main/... ./common/... ./sensors/... ./uatparse/... ./fancontrol_main/... ./godump978/...
+          go test -race ./main/... ./common/... ./sensors/... ./uatparse/... ./fancontrol_main/... ./godump978/...
+          go run test/replay_harness.go -file test-data/example.dump978
+
+      - name: Shell script syntax and shellcheck
+        run: |
+          scripts=(
+            debian/*.sh
+            debian/preinst.dpkg
+            debian/postinst.dpkg
+            debian/prerm.dpkg
+            debian/postrm.dpkg
+            ogn/*.sh
+            softrf/*.sh
+            scripts/*.sh
+            mapdata/*.sh
+            image_build/build.sh
+            image_build/stage2/10-stratux/*.sh
+            image_build/stage2/10-stratux/files/overlayctl
+            image_build/stage2/10-stratux/files/init-overlay
+            test/*.sh
+            docker_run.sh
+            cli.sh
+          )
+          for s in "${scripts[@]}"; do
+            bash -n "$s"
+          done
+          shellcheck -S error "${scripts[@]}"
+
   build:
-    # The type of runner that the job will run on
+    name: Build Debian Package (arm64)
     runs-on: ubuntu-24.04-arm
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # fetch the full repository, necessary as the latest tag is used during the build of the deb

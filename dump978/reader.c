@@ -156,8 +156,11 @@ static int process_line(struct dump978_reader *reader, frame_handler_t handler, 
             return 1;
         }
         
-        if (len >= sizeof(reader->frame))
+        if (len >= (int)sizeof(reader->frame))
             return 0; // oversized frame
+
+        if (p + 1 >= end)
+            return 0; // truncated hex byte
                 
         byte = hexbyte(p);
         if (byte < 0)

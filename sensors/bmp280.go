@@ -3,6 +3,7 @@ package sensors
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/kidoman/embd"
@@ -19,9 +20,13 @@ const (
 
 // BMP280 represents a BMP280 sensor and implements the PressureSensor interface.
 type BMP280 struct {
-	sensor  *bmp280.BMP280
-	data    *bmp280.BMPData
-	running bool
+	sensor    *bmp280.BMP280
+	data      *bmp280.BMPData
+	running   bool
+	mu        sync.RWMutex
+	done      chan struct{}
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 var errBMP = errors.New("BMP280 Error: BMP280 is not running")
@@ -43,24 +48,54 @@ func NewBMP280(i2cbus *embd.I2CBus, freq time.Duration) (*BMP280, error) {
 		return nil, errbmp
 	}
 
-	newbmp := BMP280{sensor: bmp, data: new(bmp280.BMPData)}
-	go newbmp.run()
+	newbmp := &BMP280{
+		sensor:  bmp,
+		data:    new(bmp280.BMPData),
+		running: true,
+		done:    make(chan struct{}),
+	}
+	newbmp.wg.Add(1)
+	go newbmp.run(freq)
 
-	return &newbmp, nil
+	return newbmp, nil
 }
 
-func (bmp *BMP280) run() {
-	bmp.running = true
-	clock := time.NewTicker(100 * time.Millisecond)
-	for bmp.running {
-		<-clock.C
-		bmp.data = <-bmp.sensor.C
+func (bmp *BMP280) run(freq time.Duration) {
+	defer bmp.wg.Done()
+	if freq <= 0 {
+		freq = 100 * time.Millisecond
+	}
+	clock := time.NewTicker(freq)
+	defer clock.Stop()
+
+	for {
+		select {
+		case <-bmp.done:
+			return
+		case <-clock.C:
+			select {
+			case <-bmp.done:
+				return
+			case data, ok := <-bmp.sensor.C:
+				if !ok || data == nil {
+					bmp.mu.Lock()
+					bmp.running = false
+					bmp.mu.Unlock()
+					return
+				}
+				bmp.mu.Lock()
+				bmp.data = data
+				bmp.mu.Unlock()
+			}
+		}
 	}
 }
 
 // Temperature returns the current temperature in degrees C measured by the BMP280
 func (bmp *BMP280) Temperature() (float64, error) {
-	if !bmp.running {
+	bmp.mu.RLock()
+	defer bmp.mu.RUnlock()
+	if !bmp.running || bmp.data == nil {
 		return 0, errBMP
 	}
 	return bmp.data.Temperature, nil
@@ -68,7 +103,9 @@ func (bmp *BMP280) Temperature() (float64, error) {
 
 // Pressure returns the current pressure in mbar measured by the BMP280
 func (bmp *BMP280) Pressure() (float64, error) {
-	if !bmp.running {
+	bmp.mu.RLock()
+	defer bmp.mu.RUnlock()
+	if !bmp.running || bmp.data == nil {
 		return 0, errBMP
 	}
 	return bmp.data.Pressure, nil
@@ -76,6 +113,16 @@ func (bmp *BMP280) Pressure() (float64, error) {
 
 // Close stops the measurements of the BMP280
 func (bmp *BMP280) Close() {
-	bmp.running = false
-	bmp.sensor.Close()
+	bmp.closeOnce.Do(func() {
+		bmp.mu.Lock()
+		bmp.running = false
+		bmp.mu.Unlock()
+		if bmp.done != nil {
+			close(bmp.done)
+		}
+		bmp.wg.Wait()
+		if bmp.sensor != nil {
+			bmp.sensor.Close()
+		}
+	})
 }

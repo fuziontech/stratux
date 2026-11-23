@@ -1,18 +1,20 @@
 [Unit]
 Description=Stratux
-After=network.target bluetooth.target
+After=network.target bluetooth.target stratux-update.service
 
 [Service]
-ExecStartPre=-/opt/stratux/bin/stratux-pre-start.sh
 ExecStart=/opt/stratux/bin/stratuxrun
-ExecStopPost=/usr/bin/killall dump1090 ogn-rx-eu rtl_ais stratuxrun 
-KillMode=process
+KillMode=control-group
 Restart=always
 RestartSec=5
-LimitCORE=1073741824
-
+LimitCORE=0
 StandardOutput=null
+
+# Baseline hardening compatible with Stratux network/hardware/overlay management
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=multi-user.target
-

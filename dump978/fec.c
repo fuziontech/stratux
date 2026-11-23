@@ -34,19 +34,38 @@ static void *rs_adsb_long;
 
 void init_fec(void)
 {
-    rs_adsb_short = init_rs_char(8, /* gfpoly */ ADSB_POLY, /* fcr */ 120, /* prim */ 1, /* nroots */ 12, /* pad */ 225);
-    rs_adsb_long  = init_rs_char(8, /* gfpoly */ ADSB_POLY, /* fcr */ 120, /* prim */ 1, /* nroots */ 14, /* pad */ 207);
-    rs_uplink     = init_rs_char(8, /* gfpoly */ UPLINK_POLY, /* fcr */ 120, /* prim */ 1, /* nroots */ 20, /* pad */ 163);
+    if (rs_adsb_short && rs_adsb_long && rs_uplink)
+        return;
+
+    if (!rs_adsb_short)
+        rs_adsb_short = init_rs_char(8, /* gfpoly */ ADSB_POLY, /* fcr */ 120, /* prim */ 1, /* nroots */ 12, /* pad */ 225);
+    if (!rs_adsb_long)
+        rs_adsb_long  = init_rs_char(8, /* gfpoly */ ADSB_POLY, /* fcr */ 120, /* prim */ 1, /* nroots */ 14, /* pad */ 207);
+    if (!rs_uplink)
+        rs_uplink     = init_rs_char(8, /* gfpoly */ UPLINK_POLY, /* fcr */ 120, /* prim */ 1, /* nroots */ 20, /* pad */ 163);
+
+    if (!rs_adsb_short || !rs_adsb_long || !rs_uplink) {
+        fprintf(stderr, "init_fec: init_rs_char failed\n");
+    }
 }
 
 int correct_adsb_frame(uint8_t *to, int *rs_errors)
 {
-    // Try decoding as a Long UAT.
-    // We rely on decode_rs_char not modifying the data if there were
-    // uncorrectable errors.
-    int n_corrected = decode_rs_char(rs_adsb_long, to, NULL, 0);
-    if (n_corrected >= 0 && n_corrected <= 7 && (to[0]>>3) != 0) {
+    uint8_t tmp[LONG_FRAME_BYTES];
+    int n_corrected;
+
+    if (!rs_adsb_long || !rs_adsb_short) {
+        *rs_errors = 9999;
+        return -1;
+    }
+
+    // Try decoding as a Long UAT into a scratch copy so a failed
+    // Long decode cannot mutate 'to' before retrying Basic UAT.
+    memcpy(tmp, to, sizeof(tmp));
+    n_corrected = decode_rs_char(rs_adsb_long, tmp, NULL, 0);
+    if (n_corrected >= 0 && n_corrected <= 7 && (tmp[0]>>3) != 0) {
         // Valid long frame.
+        memcpy(to, tmp, sizeof(tmp));
         *rs_errors = n_corrected;
         return 2;
     }
@@ -68,6 +87,11 @@ int correct_uplink_frame(uint8_t *from, uint8_t *to, int *rs_errors)
 {
     int block;
     int total_corrected = 0;
+
+    if (!rs_uplink) {
+        *rs_errors = 9999;
+        return -1;
+    }
 
     for (block = 0; block < UPLINK_FRAME_BLOCKS; ++block) {
         int i, n_corrected;

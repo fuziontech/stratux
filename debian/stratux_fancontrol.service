@@ -3,12 +3,21 @@ Description=Stratux Fancontrol
 
 [Service]
 ExecStart=/opt/stratux/bin/fancontrol
-KillMode=process
+KillMode=control-group
 Restart=always
 RestartSec=5
-LimitCORE=1073741824
-
+LimitCORE=0
 StandardOutput=null
+
+# Baseline hardening compatible with GPIO PWM and thermal sysfs reads
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=multi-user.target

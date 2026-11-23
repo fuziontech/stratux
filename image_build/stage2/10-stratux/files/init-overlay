@@ -1,5 +1,13 @@
 #!/bin/sh
 
+panic()
+{
+    echo "init-overlay PANIC: $*" >&2
+    exec /bin/sh
+    sleep 5
+    exit 1
+}
+
 # Try more ways how to activate filesystem support
 #  i.e. check for compiled in option or if modprobe or insmod suceed
 insmodule()
@@ -34,26 +42,34 @@ if [ -f /var/grow_root_part ]; then
     sleep 1 # otherwise proc/sys not yet ready?
 
     ROOT_PART_DEV=$(findmnt / -no source)
-    ROOT_DEV_NAME=$(lsblk -no pkname  "$ROOT_PART_DEV")
+    ROOT_DEV_NAME=$(lsblk -no pkname "$ROOT_PART_DEV")
     ROOT_DEV="/dev/${ROOT_DEV_NAME}"
-    
+
+    grow_ok=0
     echo "Growing root partition..."
-    parted $ROOT_DEV resizepart 2 100%
-    partprobe $ROOT_DEV
+    if [ -n "$ROOT_DEV_NAME" ] && [ -b "$ROOT_DEV" ] \
+        && parted -s "$ROOT_DEV" resizepart 2 100% \
+        && partprobe "$ROOT_DEV"; then
+        echo "Growing root fs..."
+        if mount -o remount,rw / && resize2fs "$ROOT_PART_DEV"; then
+            rm -f /var/grow_root_part
+            grow_ok=1
+        else
+            echo "ERROR: Failed to resize root filesystem on ${ROOT_PART_DEV}" >&2
+        fi
+    else
+        echo "ERROR: Failed to resize root partition on ${ROOT_DEV}" >&2
+    fi
 
-    echo "Growing root fs..."
-    mount -o remount,rw /
-    resize2fs $ROOT_PART_DEV
-
-    rm /var/grow_root_part
-
-    #mount -o remount,ro /
-    umount /sys
-    umount /proc
     sync
-    reboot -f
-    sleep 5
-    exit 0
+    mount -o remount,ro / || true
+    umount /sys || true
+    umount /proc || true
+    if [ "$grow_ok" -eq 1 ]; then
+        reboot -f
+        sleep 5
+        exit 0
+    fi
 fi
 
 
@@ -236,7 +252,7 @@ echo "Ready to proceed by pivot_root"
 
 /sbin/pivot_root . overlay/pivot
 
-# Stratux: remove old logs from the overlay so that logrotate doesn't start to rotate and fill up the overlay
-rm -r /var/log/*
+# Stratux: remove old log files from the overlay while preserving subdirectories
+find /var/log -type f -delete 2>/dev/null || true
 
 exec /usr/sbin/chroot . sbin/init

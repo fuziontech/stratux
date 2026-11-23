@@ -19,6 +19,8 @@ import (
 	"regexp"
 )
 
+var xplaneCallSignSanitizer = regexp.MustCompile("[^a-zA-Z0-9]+")
+
 func convertKnotsToXPlaneSpeed(knots float32) float32 {
 	return knots / 1.94384 // meters per second
 }
@@ -47,8 +49,7 @@ func createXPlaneTrafficMsg(targetId uint32, latDeg float32, lonDeg float32, alt
 	}
 
 	// prepare callsign (remove all non-alphanumeric characters)
-	regEx, _ := regexp.Compile("[^a-zA-Z0-9]+")
-	cleanCallSign := regEx.ReplaceAllString(callSign, "")
+	cleanCallSign := xplaneCallSignSanitizer.ReplaceAllString(callSign, "")
 
 	return []byte(fmt.Sprintf("XTRAFFICStratux,%d,%.6f,%.6f,%d,%d,%d,%d,%d,%s", targetId, latDeg, lonDeg, altFt, vSpeedFpm, airborneValue, trackDeg, hSpeedKt, cleanCallSign))
 }
