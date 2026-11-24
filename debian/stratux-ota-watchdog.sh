@@ -20,10 +20,11 @@ OTA_PENDING_REL="${OTA_REL_DIR}/ota_pending"
 OTA_BACKUP_REL="${OTA_REL_DIR}/ota_backup/previous.tar.gz"
 OTA_STATUS_REL="${OTA_REL_DIR}/ota_last_status"
 
-MAX_WAIT_SECONDS=45
+MAX_WAIT_SECONDS=90
 POLL_INTERVAL=3
 REQUIRED_CONSECUTIVE=3
 HEALTH_URL="http://127.0.0.1/getStatus"
+INSTALL_LOCK="/run/stratux-ota-install.lock"
 
 wLog() {
 	mkdir -p "$(dirname -- "${STX_LOG}")" 2>/dev/null || true
@@ -36,8 +37,27 @@ overlay_is_active() {
 	[ "${fstype}" = "overlay" ]
 }
 
+# Never run while an OTA installation is actively in progress on this boot.
+if [ -f "${INSTALL_LOCK}" ]; then
+	wLog "OTA installation lock ${INSTALL_LOCK} is present; skipping watchdog on install boot."
+	exit 0
+fi
+
 # Fast no-op exit when no OTA update is pending.
-if [ ! -f "/${OTA_PENDING_REL}" ] && [ ! -f "/overlay/robase/${OTA_PENDING_REL}" ]; then
+PENDING_FILE=""
+if [ -f "/${OTA_PENDING_REL}" ]; then
+	PENDING_FILE="/${OTA_PENDING_REL}"
+elif [ -f "/overlay/robase/${OTA_PENDING_REL}" ]; then
+	PENDING_FILE="/overlay/robase/${OTA_PENDING_REL}"
+else
+	exit 0
+fi
+
+# Never verify on the same boot that armed ota_pending (wait for the post-install reboot).
+pending_boot_id="$(sed -n 's/^boot_id=//p' "${PENDING_FILE}" 2>/dev/null | head -n1 || true)"
+current_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+if [ -n "${pending_boot_id}" ] && [ -n "${current_boot_id}" ] && [ "${pending_boot_id}" = "${current_boot_id}" ]; then
+	wLog "OTA pending flag was armed on the current boot (${current_boot_id}); deferring verification until reboot."
 	exit 0
 fi
 
@@ -127,7 +147,7 @@ if overlay_is_active; then
 fi
 
 if [ -n "${backup_archive}" ] && [ -f "${backup_archive}" ]; then
-	if tar -xzf "${backup_archive}" -C "${target_root}" >> "${STX_LOG}" 2>&1; then
+	if tar --no-same-owner -xzf "${backup_archive}" -C "${target_root}" >> "${STX_LOG}" 2>&1; then
 		wLog "Extracted rollback archive ${backup_archive} into ${target_root}."
 	else
 		wLog "ERROR: Failed to extract rollback archive ${backup_archive} into ${target_root}."

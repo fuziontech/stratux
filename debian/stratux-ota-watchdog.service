@@ -1,7 +1,8 @@
 [Unit]
 Description=Stratux OTA Health-Check Watchdog and Auto-Rollback
-After=stratux.service
+After=stratux-update.service stratux.service
 Wants=stratux.service
+ConditionPathExists=!/run/stratux-ota-install.lock
 
 [Service]
 Type=oneshot

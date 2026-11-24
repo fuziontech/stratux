@@ -188,7 +188,7 @@ create_ota_backup() {
 	fi
 
 	rm -f -- "${OTA_BACKUP_ARCHIVE}"
-	if tar -czf "${OTA_BACKUP_ARCHIVE}" -C / "${backup_paths[@]}" >> "${STX_LOG}" 2>&1; then
+	if tar --exclude='opt/stratux/mapdata' -czf "${OTA_BACKUP_ARCHIVE}" -C / "${backup_paths[@]}" >> "${STX_LOG}" 2>&1; then
 		wLog "Created OTA rollback snapshot at ${OTA_BACKUP_ARCHIVE}"
 		return 0
 	fi
@@ -339,18 +339,22 @@ if (( ${#update_package_files[@]} > 0 )); then
 			rm -f /overlay/disable
 		else
 			wLog "Installing update package ${UPDATE_PACKAGE_FILE}..."
+			touch /run/stratux-ota-install.lock
 			base_name="$(basename -- "${UPDATE_PACKAGE_FILE}")"
 			UPDATE_TEMP_FILE="/tmp/${base_name}"
 			mv -- "${UPDATE_PACKAGE_FILE}" "${UPDATE_TEMP_FILE}"
 			remove_sig_sidecars "${UPDATE_PACKAGE_FILE}"
-			# Snapshot existing installation and arm the post-boot OTA health watchdog.
+			# Remove any stale pending flag before installing so the watchdog cannot fire mid-dpkg.
+			rm -f -- "${OTA_PENDING_FILE}"
+			# Snapshot existing installation for post-boot OTA rollback.
 			create_ota_backup || true
-			mkdir -p "${OTA_STATE_DIR}"
-			printf 'package=%s\ntimestamp=%s\n' "${base_name}" "$(date -u +%FT%TZ)" > "${OTA_PENDING_FILE}"
 			# Re-enable overlay for next boot before calling dpkg.
 			rm -f /overlay/disable
 			if STRATUX_OTA_INSTALL=1 DEBIAN_FRONTEND=noninteractive dpkg -i --force-depends --force-confnew "${UPDATE_TEMP_FILE}" >> "${STX_LOG}" 2>&1; then
-				wLog "Package installed successfully. Post-boot OTA watchdog armed."
+				mkdir -p "${OTA_STATE_DIR}"
+				boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+				printf 'package=%s\ntimestamp=%s\nboot_id=%s\n' "${base_name}" "$(date -u +%FT%TZ)" "${boot_id}" > "${OTA_PENDING_FILE}"
+				wLog "Package installed successfully. Post-boot OTA watchdog armed for next boot."
 				rm -f -- "${UPDATE_TEMP_FILE}"
 				do_reboot "Finished package installation. Rebooting..."
 			else
