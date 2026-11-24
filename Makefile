@@ -126,7 +126,7 @@ dpkg: optinstall_dpkg
 	# Create the directories inside of the dpkg environment
 	mkdir -p $(DEBPKG_BASE)/etc/udev/rules.d/
 	mkdir -p $(DEBPKG_BASE)/etc/avahi/services/
-	mkdir -p $(DEBPKG_BASE)/lib/systemd/system/
+	mkdir -p $(DEBPKG_BASE)/usr/lib/systemd/system/
 	# Copy the udev rules to the dpkg environment
 	cp -f debian/10-stratux.rules $(DEBPKG_BASE)/etc/udev/rules.d/10-stratux.rules
 	cp -f debian/99-uavionix.rules $(DEBPKG_BASE)/etc/udev/rules.d/99-uavionix.rules
@@ -135,13 +135,13 @@ dpkg: optinstall_dpkg
 	# Copy the Avahi mDNS service definition
 	cp -f debian/stratux-avahi.service $(DEBPKG_BASE)/etc/avahi/services/stratux.service
 	chmod 0644 $(DEBPKG_BASE)/etc/avahi/services/stratux.service
-	# Copy the systemd units to the dpkg environment
-	cp -f debian/stratux.service $(DEBPKG_BASE)/lib/systemd/system/stratux.service
-	cp -f debian/stratux-update.service $(DEBPKG_BASE)/lib/systemd/system/stratux-update.service
-	cp -f debian/stratux-ota-watchdog.service $(DEBPKG_BASE)/lib/systemd/system/stratux-ota-watchdog.service
-	cp -f debian/stratux-usb-gadget.service $(DEBPKG_BASE)/lib/systemd/system/stratux-usb-gadget.service
-	cp -f debian/stratux_fancontrol.service $(DEBPKG_BASE)/lib/systemd/system/stratux_fancontrol.service
-	chmod 0644 $(DEBPKG_BASE)/lib/systemd/system/*.service
+	# Copy the systemd units to the dpkg environment (canonical usrmerge path on Debian 12+)
+	cp -f debian/stratux.service $(DEBPKG_BASE)/usr/lib/systemd/system/stratux.service
+	cp -f debian/stratux-update.service $(DEBPKG_BASE)/usr/lib/systemd/system/stratux-update.service
+	cp -f debian/stratux-ota-watchdog.service $(DEBPKG_BASE)/usr/lib/systemd/system/stratux-ota-watchdog.service
+	cp -f debian/stratux-usb-gadget.service $(DEBPKG_BASE)/usr/lib/systemd/system/stratux-usb-gadget.service
+	cp -f debian/stratux_fancontrol.service $(DEBPKG_BASE)/usr/lib/systemd/system/stratux_fancontrol.service
+	chmod 0644 $(DEBPKG_BASE)/usr/lib/systemd/system/*.service
 	# Set up version and arch inside DEBIAN/control
 	sed -i 's/VERSION/$(VERSIONSTR)/g' $(DEBPKG_BASE)/DEBIAN/control
 	sed -i 's/ARCH/$(ARCH)/g' $(DEBPKG_BASE)/DEBIAN/control

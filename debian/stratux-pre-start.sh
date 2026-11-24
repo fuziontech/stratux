@@ -175,8 +175,12 @@ create_ota_backup() {
 	if [ -d /opt/stratux ]; then
 		backup_paths+=( "opt/stratux" )
 	fi
+	local svc_dir="/usr/lib/systemd/system"
+	if [ ! -d "${svc_dir}" ]; then
+		svc_dir="/lib/systemd/system"
+	fi
 	local svc
-	for svc in /lib/systemd/system/stratux*.service; do
+	for svc in "${svc_dir}"/stratux*.service; do
 		if [ -e "${svc}" ]; then
 			backup_paths+=( "${svc#/}" )
 		fi
@@ -205,7 +209,7 @@ restore_ota_backup() {
 	mkdir -p "$(dirname -- "${OTA_ROLLBACK_LOG}")" "${OTA_STATE_DIR}"
 	echo "${ts} IMMEDIATE_ROLLBACK: ${reason}" >> "${OTA_ROLLBACK_LOG}"
 	if [ -f "${OTA_BACKUP_ARCHIVE}" ]; then
-		if tar -xzf "${OTA_BACKUP_ARCHIVE}" -C / >> "${STX_LOG}" 2>&1; then
+		if tar --keep-directory-symlink --no-same-owner -xzf "${OTA_BACKUP_ARCHIVE}" -C / >> "${STX_LOG}" 2>&1; then
 			wLog "Restored previous Stratux installation from ${OTA_BACKUP_ARCHIVE}."
 			systemctl daemon-reload 2>/dev/null || true
 		else

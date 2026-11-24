@@ -147,7 +147,7 @@ if overlay_is_active; then
 fi
 
 if [ -n "${backup_archive}" ] && [ -f "${backup_archive}" ]; then
-	if tar --no-same-owner -xzf "${backup_archive}" -C "${target_root}" >> "${STX_LOG}" 2>&1; then
+	if tar --keep-directory-symlink --no-same-owner -xzf "${backup_archive}" -C "${target_root}" >> "${STX_LOG}" 2>&1; then
 		wLog "Extracted rollback archive ${backup_archive} into ${target_root}."
 	else
 		wLog "ERROR: Failed to extract rollback archive ${backup_archive} into ${target_root}."
