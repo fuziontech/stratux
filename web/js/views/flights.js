@@ -2,6 +2,8 @@ import {
   apiGet,
   createEl,
   formatUptime,
+  isValidAhrsAngle,
+  normalizeHeadingDeg,
   setConnectionBadge,
   showToast
 } from '../app.js';
@@ -147,13 +149,17 @@ export async function mount(container) {
 
     // Point telemetry readout
     elPointMetrics.textContent = '';
+    const baroValid = typeof pt.BaroAltFt === 'number' && Number.isFinite(pt.BaroAltFt) && Math.abs(pt.BaroAltFt) < 100000;
+    const pitchValid = isValidAhrsAngle(pt.PitchDeg, 90);
+    const rollValid = isValidAhrsAngle(pt.RollDeg, 180);
+    const trackNorm = normalizeHeadingDeg(pt.TrackDeg);
     const metrics = [
       ['Time', pt.Time ? String(pt.Time).slice(11, 19) + 'Z' : '--'],
-      ['GPS Alt MSL', `${Math.round(pt.AltMSLFt || 0)} ft`],
-      ['Baro Alt', `${Math.round(pt.BaroAltFt || 0)} ft`],
-      ['Speed', `${Math.round(pt.SpeedKt || 0)} kt`],
-      ['Track', `${Math.round(pt.TrackDeg || 0)}\u00B0`],
-      ['Pitch / Roll', `${Number(pt.PitchDeg || 0).toFixed(1)}\u00B0 / ${Number(pt.RollDeg || 0).toFixed(1)}\u00B0`]
+      ['GPS Alt MSL', Number.isFinite(pt.AltMSLFt) ? `${Math.round(pt.AltMSLFt)} ft` : '--'],
+      ['Baro Alt', baroValid ? `${Math.round(pt.BaroAltFt)} ft` : '--'],
+      ['Speed', Number.isFinite(pt.SpeedKt) ? `${Math.round(pt.SpeedKt)} kt` : '--'],
+      ['Track', trackNorm !== null ? `${String(trackNorm).padStart(3, '0')}\u00B0` : '--'],
+      ['Pitch / Roll', `${pitchValid ? pt.PitchDeg.toFixed(1) + '\u00B0' : '--'} / ${rollValid ? pt.RollDeg.toFixed(1) + '\u00B0' : '--'}`]
     ];
     for (const [k, v] of metrics) {
       const m = createEl('div', { className: 'metric' });

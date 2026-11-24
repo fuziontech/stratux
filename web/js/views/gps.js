@@ -3,7 +3,12 @@ import {
   apiPost,
   apiPostRaw,
   createEl,
+  getGpsHardwareLabel,
   isNonZeroTimestamp,
+  isValidAhrsAngle,
+  isValidAhrsGLoad,
+  isValidGpsAccuracy,
+  normalizeHeadingDeg,
   setConnectionBadge,
   showToast,
   StratuxWS,
@@ -14,6 +19,8 @@ export async function mount(container) {
   let destroyed = false;
   let gMinLim = -1.76;
   let gMaxLim = 4.4;
+  let lastStatus = null;
+  let lastSituation = null;
   const wakeLock = new WakeLockManager();
 
   container.innerHTML = `
@@ -32,6 +39,8 @@ export async function mount(container) {
         <button type="button" class="btn btn-sm" id="btn-reset-g">Reset G</button>
       </div>
     </div>
+
+    <div id="gps-diag-banner" class="alert-banner alert-info hidden"></div>
 
     <div class="ahrs-grid">
       <section class="card">
@@ -186,6 +195,7 @@ export async function mount(container) {
   const elRoll = container.querySelector('#val-roll');
   const elSlip = container.querySelector('#val-slip');
   const elBaro = container.querySelector('#val-baro');
+  const elGpsDiag = container.querySelector('#gps-diag-banner');
   const elGpsFixBadge = container.querySelector('#gps-fix-badge');
   const elGpsKv = container.querySelector('#gps-kv');
   const elSatChart = container.querySelector('#sat-chart');
@@ -295,8 +305,38 @@ export async function mount(container) {
     elModalHost.appendChild(backdrop);
   }
 
+  function renderDiagBanner(sit) {
+    if (!elGpsDiag) return;
+    const connected = lastStatus ? Boolean(lastStatus.GPS_connected) : isNonZeroTimestamp(sit?.GPSLastValidNMEAMessageTime);
+    const fixQ = sit?.GPSFixQuality || 0;
+    const seen = sit?.GPSSatellitesSeen ?? lastStatus?.GPS_satellites_seen ?? 0;
+    const tracked = sit?.GPSSatellitesTracked ?? lastStatus?.GPS_satellites_tracked ?? 0;
+
+    if (connected && fixQ >= 1) {
+      elGpsDiag.classList.add('hidden');
+      return;
+    }
+
+    elGpsDiag.classList.remove('hidden');
+    if (!connected) {
+      elGpsDiag.className = 'alert-banner alert-warn';
+      elGpsDiag.textContent =
+        'GPS receiver disconnected (no valid NMEA sentences received). Check USB/serial connection, ensure GPS is enabled in Settings, or verify baud/port in Developer logs.';
+    } else if (seen === 0) {
+      const hw = lastStatus ? getGpsHardwareLabel(lastStatus.GPS_detected_type) : 'GPS receiver';
+      elGpsDiag.className = 'alert-banner alert-info';
+      elGpsDiag.textContent =
+        `${hw} connected and streaming NMEA, but 0 satellites have signal yet (${tracked} in almanac). Move near a window or outdoors with clear sky view; keep the GPS antenna separated from RTL-SDR dongles (1–3 min for cold start).`;
+    } else {
+      elGpsDiag.className = 'alert-banner alert-info';
+      elGpsDiag.textContent =
+        `Acquiring 3D GPS lock: ${seen} satellite${seen === 1 ? '' : 's'} with signal (${tracked} tracked). Airborne 3D mode requires at least 4 satellites with good sky geometry (C/N0 > 25 dB-Hz).`;
+    }
+  }
+
   function renderSituation(sit) {
     if (!sit) return;
+    lastSituation = sit;
 
     const statusBits = sit.AHRSStatus || 0;
     elPillGps.className = `badge ${(statusBits & 0x01) ? 'badge-ok' : ''}`;
@@ -305,60 +345,115 @@ export async function mount(container) {
     elPillCal.className = `badge ${(statusBits & 0x08) ? 'badge-warn' : 'badge-ok'}`;
     elPillCal.textContent = (statusBits & 0x08) ? 'Caging...' : 'Ready';
 
-    // GPS fix card
-    const fixLabels = { 0: 'No Fix', 1: '3D GPS', 2: '3D GPS + SBAS', 6: 'Dead Reckoning' };
-    const fixText = fixLabels[sit.GPSFixQuality] || 'Unknown';
-    elGpsFixBadge.textContent = fixText;
-    elGpsFixBadge.className = `badge ${sit.GPSFixQuality >= 1 ? 'badge-ok' : 'badge-warn'}`;
+    renderDiagBanner(sit);
 
-    const zero = sit.GPSLatitude === 0 && sit.GPSLongitude === 0;
-    const horizBad = sit.GPSHorizontalAccuracy > 19999 || zero;
+    // GPS fix card
+    const connected = lastStatus ? Boolean(lastStatus.GPS_connected) : isNonZeroTimestamp(sit.GPSLastValidNMEAMessageTime);
+    const fixLabels = {
+      0: 'No Fix',
+      1: '3D GPS',
+      2: '3D GPS + SBAS',
+      4: 'RTK Fixed',
+      5: 'RTK Float',
+      6: 'Dead Reckoning'
+    };
+    const fixText = !connected
+      ? 'Disconnected'
+      : (lastStatus?.GPS_solution || fixLabels[sit.GPSFixQuality] || 'Unknown');
+    const fixOk = connected && (sit.GPSFixQuality || 0) >= 1;
+    elGpsFixBadge.textContent = fixText;
+    elGpsFixBadge.className = `badge ${fixOk ? 'badge-ok' : 'badge-warn'}`;
+
+    const zeroCoords = sit.GPSLatitude === 0 && sit.GPSLongitude === 0;
+    const hasFix = fixOk && !zeroCoords && Number.isFinite(sit.GPSLatitude) && Number.isFinite(sit.GPSLongitude);
+    const horizAccOk = hasFix && isValidGpsAccuracy(sit.GPSHorizontalAccuracy);
+    const vertAccOk = hasFix && isValidGpsAccuracy(sit.GPSVerticalAccuracy);
+    const courseNorm = normalizeHeadingDeg(sit.GPSTrueCourse);
+    const vsiFpm = Number.isFinite(sit.GPSVerticalSpeed) ? Math.round(sit.GPSVerticalSpeed * 60) : 0;
+
     elGpsKv.textContent = '';
-    elGpsKv.appendChild(kvRow('Latitude / Longitude', horizBad ? '--' : `${sit.GPSLatitude.toFixed(5)}, ${sit.GPSLongitude.toFixed(5)}`));
-    elGpsKv.appendChild(kvRow('Ground Speed / Track', horizBad ? '--' : `${sit.GPSGroundSpeed.toFixed(1)} kt / ${sit.GPSTrueCourse.toFixed(1)}\u00B0`));
-    elGpsKv.appendChild(kvRow('GPS Alt MSL / VSI', horizBad ? '--' : `${Math.round(sit.GPSAltitudeMSL)} ft / ${Math.round(sit.GPSVerticalSpeed)} fpm`));
-    elGpsKv.appendChild(kvRow('Horiz / Vert Acc', `${horizBad ? '\u221E' : sit.GPSHorizontalAccuracy.toFixed(1) + ' m'} / ${horizBad ? '\u221E' : (sit.GPSVerticalAccuracy * 3.2808).toFixed(1) + ' ft'}`));
-    elGpsKv.appendChild(kvRow('Satellites (Lock/Trk/Seen)', `${sit.GPSSatellites ?? 0} / ${sit.GPSSatellitesTracked ?? 0} / ${sit.GPSSatellitesSeen ?? 0}`));
-    elGpsKv.appendChild(kvRow('Sample Rate', `${Number(sit.GPSPositionSampleRate || 0).toFixed(1)} Hz`));
+    if (lastStatus) {
+      elGpsKv.appendChild(kvRow('Hardware', getGpsHardwareLabel(lastStatus.GPS_detected_type)));
+    }
+    elGpsKv.appendChild(kvRow('Latitude / Longitude', hasFix ? `${sit.GPSLatitude.toFixed(5)}, ${sit.GPSLongitude.toFixed(5)}` : '--'));
+    elGpsKv.appendChild(kvRow(
+      'Ground Speed / Track',
+      hasFix && Number.isFinite(sit.GPSGroundSpeed)
+        ? `${sit.GPSGroundSpeed.toFixed(1)} kt / ${courseNorm !== null ? String(courseNorm).padStart(3, '0') + '\u00B0' : '--'}`
+        : '--'
+    ));
+    elGpsKv.appendChild(kvRow(
+      'GPS Alt MSL / VSI',
+      hasFix && Number.isFinite(sit.GPSAltitudeMSL)
+        ? `${Math.round(sit.GPSAltitudeMSL)} ft / ${vsiFpm >= 0 ? '+' : ''}${vsiFpm} fpm`
+        : '--'
+    ));
+    elGpsKv.appendChild(kvRow(
+      'Horiz / Vert Acc',
+      `${horizAccOk ? sit.GPSHorizontalAccuracy.toFixed(1) + ' m' : '--'} / ${vertAccOk ? (sit.GPSVerticalAccuracy * 3.28084).toFixed(1) + ' ft' : '--'}`
+    ));
+    elGpsKv.appendChild(kvRow(
+      'Satellites (Lock/Trk/Seen)',
+      `${sit.GPSSatellites ?? 0} / ${sit.GPSSatellitesTracked ?? 0} / ${sit.GPSSatellitesSeen ?? 0}`
+    ));
+    elGpsKv.appendChild(kvRow(
+      'NACp / Sample Rate',
+      `${hasFix && sit.GPSNACp > 0 ? 'NACp ' + sit.GPSNACp : '--'} / ${Number.isFinite(sit.GPSPositionSampleRate) && sit.GPSPositionSampleRate > 0 ? sit.GPSPositionSampleRate.toFixed(1) + ' Hz' : '--'}`
+    ));
 
     // Baro
-    const pressValid = isNonZeroTimestamp(sit.BaroLastMeasurementTime);
+    const pressValid = isNonZeroTimestamp(sit.BaroLastMeasurementTime) &&
+      (sit.BaroSourceType || 0) !== 0 &&
+      typeof sit.BaroPressureAltitude === 'number' &&
+      Number.isFinite(sit.BaroPressureAltitude) &&
+      Math.abs(sit.BaroPressureAltitude) < 100000;
     elBaro.textContent = pressValid ? `${Math.round(sit.BaroPressureAltitude)} ft` : '--';
 
     // Attitude
-    const ahrsValid = isNonZeroTimestamp(sit.AHRSLastAttitudeTime) && Math.abs(sit.AHRSPitch) <= 360 && Math.abs(sit.AHRSRoll) <= 360;
+    const pitchValid = isValidAhrsAngle(sit.AHRSPitch, 90);
+    const rollValid = isValidAhrsAngle(sit.AHRSRoll, 180);
+    const ahrsValid = isNonZeroTimestamp(sit.AHRSLastAttitudeTime) && pitchValid && rollValid;
     if (ahrsValid) {
-      const pitch = Number(sit.AHRSPitch) || 0;
-      const roll = Number(sit.AHRSRoll) || 0;
-      const slip = Number(sit.AHRSSlipSkid) || 0;
-      const hdg = Number(sit.AHRSGyroHeading);
+      const pitch = sit.AHRSPitch;
+      const roll = sit.AHRSRoll;
+      const slipValid = isValidAhrsAngle(sit.AHRSSlipSkid, 90);
+      const slip = slipValid ? sit.AHRSSlipSkid : 0;
+      const hdgValid = isValidAhrsAngle(sit.AHRSGyroHeading, 360) && sit.AHRSGyroHeading >= 0;
+      const hdgNorm = hdgValid ? normalizeHeadingDeg(sit.AHRSGyroHeading) : null;
 
       elPitch.textContent = `${pitch.toFixed(1)}\u00B0`;
       elRoll.textContent = `${roll.toFixed(1)}\u00B0`;
-      elSlip.textContent = `${slip.toFixed(1)}\u00B0`;
-      elHdgBadge.textContent = hdg <= 360 ? `HDG ${String(Math.round(hdg)).padStart(3, '0')}\u00B0` : 'HDG ---\u00B0';
+      elSlip.textContent = slipValid ? `${slip.toFixed(1)}\u00B0` : '--';
+      elHdgBadge.textContent = hdgNorm !== null ? `HDG ${String(hdgNorm).padStart(3, '0')}\u00B0` : 'HDG ---\u00B0';
 
       const pitchPx = Math.max(-120, Math.min(120, pitch * 4));
       elWorld.setAttribute('transform', `rotate(${(-roll).toFixed(2)}) translate(0 ${pitchPx.toFixed(2)})`);
       const ballX = Math.max(-38, Math.min(38, slip * 3));
       elSlipBall.setAttribute('cx', ballX.toFixed(1));
 
-      if (Math.abs(sit.AHRSGLoad) <= 30) {
+      if (isValidAhrsGLoad(sit.AHRSGLoad)) {
         const g = sit.AHRSGLoad;
-        const gMin = sit.AHRSGLoadMin ?? g;
-        const gMax = sit.AHRSGLoadMax ?? g;
+        const gMin = isValidAhrsGLoad(sit.AHRSGLoadMin) ? sit.AHRSGLoadMin : g;
+        const gMax = isValidAhrsGLoad(sit.AHRSGLoadMax) ? sit.AHRSGLoadMax : g;
         elGCur.textContent = `${g.toFixed(2)} G`;
         elGMinMax.textContent = `${gMin.toFixed(2)} / ${gMax.toFixed(2)} G`;
         elGNeedle.setAttribute('transform', `rotate(${gToDeg(g).toFixed(1)})`);
         elGMinNeedle.setAttribute('transform', `rotate(${gToDeg(gMin).toFixed(1)})`);
         elGMaxNeedle.setAttribute('transform', `rotate(${gToDeg(gMax).toFixed(1)})`);
         elGCur.className = (g > gMaxLim || g < gMinLim) ? 'badge badge-danger mono' : 'badge mono';
+      } else {
+        elGCur.textContent = '-- G';
+        elGCur.className = 'badge mono';
+        elGMinMax.textContent = '-- / --';
       }
     } else {
       elPitch.textContent = '--';
       elRoll.textContent = '--';
       elSlip.textContent = '--';
       elHdgBadge.textContent = 'HDG ---\u00B0';
+      elGCur.textContent = '-- G';
+      elGCur.className = 'badge mono';
+      elGMinMax.textContent = '-- / --';
     }
   }
 
@@ -366,7 +461,7 @@ export async function mount(container) {
     try {
       const data = await apiGet('/getSatellites', { optional: true });
       if (destroyed || !data || typeof data !== 'object') return;
-      const list = Object.values(data).sort((a, b) => (b.Signal || -99) - (a.Signal || -99));
+      const list = Object.values(data).sort((a, b) => (b.Signal ?? -99) - (a.Signal ?? -99));
       elSatCount.textContent = `${list.length} Sats`;
       elSatChart.textContent = '';
       elSatBody.textContent = '';
@@ -377,9 +472,16 @@ export async function mount(container) {
       }
 
       for (const sat of list) {
-        const sig = Math.max(0, Math.min(60, Number(sat.Signal) || 0));
-        const col = createEl('div', { className: 'sat-col', title: `${sat.SatelliteID}: ${sat.Signal} dB-Hz` });
-        col.appendChild(createEl('span', { className: 'sat-lbl muted', text: sat.Signal > 0 ? String(sat.Signal) : '-' }));
+        const hasSig = typeof sat.Signal === 'number' && Number.isFinite(sat.Signal) && sat.Signal > 0 && sat.Signal <= 99;
+        const sig = hasSig ? Math.min(60, sat.Signal) : 0;
+        const elevValid = typeof sat.Elevation === 'number' && Number.isFinite(sat.Elevation) && sat.Elevation >= -90 && sat.Elevation <= 90;
+        const azimValid = typeof sat.Azimuth === 'number' && Number.isFinite(sat.Azimuth) && sat.Azimuth >= 0 && sat.Azimuth <= 360;
+
+        const col = createEl('div', {
+          className: 'sat-col',
+          title: `${sat.SatelliteID || '?'}: ${hasSig ? sat.Signal + ' dB-Hz' : 'no signal'}`
+        });
+        col.appendChild(createEl('span', { className: 'sat-lbl muted', text: hasSig ? String(sat.Signal) : '-' }));
         col.appendChild(createEl('div', {
           className: `sat-bar ${sat.InSolution ? 'in-sol' : ''}`,
           style: { height: `${Math.max(4, Math.round((sig / 60) * 88))}px` }
@@ -389,9 +491,9 @@ export async function mount(container) {
 
         const tr = createEl('tr', {});
         tr.appendChild(createEl('td', { className: 'mono', text: sat.SatelliteID || '--' }));
-        tr.appendChild(createEl('td', { className: 'mono', text: sat.Signal > -50 ? `${sat.Signal} dB` : '--' }));
-        tr.appendChild(createEl('td', { className: 'mono', text: `${sat.Elevation ?? '--'}\u00B0` }));
-        tr.appendChild(createEl('td', { className: 'mono', text: `${sat.Azimuth ?? '--'}\u00B0` }));
+        tr.appendChild(createEl('td', { className: 'mono', text: hasSig ? `${sat.Signal} dB` : '--' }));
+        tr.appendChild(createEl('td', { className: 'mono', text: elevValid ? `${sat.Elevation}\u00B0` : '--' }));
+        tr.appendChild(createEl('td', { className: 'mono', text: azimValid ? `${sat.Azimuth}\u00B0` : '--' }));
         tr.appendChild(createEl('td', {}, createEl('span', {
           className: `badge ${sat.InSolution ? 'badge-ok' : ''}`,
           text: sat.InSolution ? 'Yes' : 'No'
@@ -411,6 +513,13 @@ export async function mount(container) {
     }
   }).catch(() => {});
 
+  apiGet('/getStatus', { optional: true }).then((st) => {
+    if (!destroyed && st) {
+      lastStatus = st;
+      if (lastSituation) renderSituation(lastSituation);
+      else renderDiagBanner(null);
+    }
+  }).catch(() => {});
   apiGet('/getSituation', { optional: true }).then((s) => { if (!destroyed && s) renderSituation(s); }).catch(() => {});
   fetchSatellites();
 
@@ -421,11 +530,21 @@ export async function mount(container) {
     onMessage: (data) => { if (!destroyed) renderSituation(data); }
   });
 
+  const statusWS = new StratuxWS('/status', {
+    onMessage: (st) => {
+      if (destroyed || !st) return;
+      lastStatus = st;
+      if (lastSituation) renderSituation(lastSituation);
+      else renderDiagBanner(null);
+    }
+  });
+
   const satTimer = setInterval(fetchSatellites, 1500);
 
   return function destroy() {
     destroyed = true;
     sitWS.close();
+    statusWS.close();
     clearInterval(satTimer);
     themeObserver.disconnect();
     wakeLock.release();

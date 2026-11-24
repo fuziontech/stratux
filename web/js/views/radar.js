@@ -3,6 +3,8 @@ import {
   audioAlerts,
   getCraftHexColor,
   isNonZeroTimestamp,
+  isValidGpsAccuracy,
+  normalizeHeadingDeg,
   setConnectionBadge,
   StratuxWS
 } from '../app.js';
@@ -234,7 +236,9 @@ export async function mount(container) {
         continue;
       }
 
-      const altDiffFt = own.altFt !== null && t.Alt ? t.Alt - own.altFt : null;
+      const hasAlt = typeof t.Alt === 'number' && Number.isFinite(t.Alt) &&
+        (isNonZeroTimestamp(t.Last_alt) || t.Alt !== 0);
+      const altDiffFt = own.altFt !== null && hasAlt ? t.Alt - own.altFt : null;
       if (altDiffFt !== null && Math.abs(altDiffFt) > altLimitFt) continue;
 
       if (!t.Position_valid) {
@@ -378,8 +382,9 @@ export async function mount(container) {
     ctx.fillStyle = text;
     ctx.font = 'bold 12px ui-monospace, monospace';
     ctx.textAlign = 'left';
+    const hudHdg = normalizeHeadingDeg(own.course);
     ctx.fillText(
-      own.gpsValid ? `HDG ${String(Math.round(own.course)).padStart(3, '0')}\u00B0` : 'NO GPS FIX',
+      own.gpsValid && hudHdg !== null ? `HDG ${String(hudHdg).padStart(3, '0')}\u00B0` : 'NO GPS FIX',
       12, 20
     );
     ctx.textAlign = 'right';
@@ -437,18 +442,26 @@ export async function mount(container) {
   const sitWS = new StratuxWS('/situation', {
     onMessage: (sit) => {
       if (destroyed || !sit) return;
-      own.gpsValid = Boolean(sit.GPSHorizontalAccuracy < 19999 && (sit.GPSLatitude !== 0 || sit.GPSLongitude !== 0));
+      const hasCoords = Number.isFinite(sit.GPSLatitude) && Number.isFinite(sit.GPSLongitude) &&
+        (sit.GPSLatitude !== 0 || sit.GPSLongitude !== 0);
+      own.gpsValid = Boolean((sit.GPSFixQuality || 0) >= 1 && isValidGpsAccuracy(sit.GPSHorizontalAccuracy) && hasCoords);
       if (own.gpsValid) {
         own.lat = sit.GPSLatitude;
         own.lon = sit.GPSLongitude;
-        own.course = sit.GPSTrueCourse || 0;
+        own.course = Number.isFinite(sit.GPSTrueCourse) ? sit.GPSTrueCourse : 0;
       }
-      const pressValid = isNonZeroTimestamp(sit.BaroLastMeasurementTime);
+      const pressValid = isNonZeroTimestamp(sit.BaroLastMeasurementTime) &&
+        (sit.BaroSourceType || 0) !== 0 &&
+        typeof sit.BaroPressureAltitude === 'number' &&
+        Number.isFinite(sit.BaroPressureAltitude) &&
+        Math.abs(sit.BaroPressureAltitude) < 100000;
       const gpsTimeValid = isNonZeroTimestamp(sit.GPSLastGPSTimeStratuxTime);
-      if (pressValid && gpsTimeValid && (Date.parse(sit.GPSLastGPSTimeStratuxTime) - Date.parse(sit.BaroLastMeasurementTime) < 1000)) {
+      if (pressValid && (!own.gpsValid || !gpsTimeValid || Math.abs(Date.parse(sit.GPSLastGPSTimeStratuxTime) - Date.parse(sit.BaroLastMeasurementTime)) < 5000)) {
         own.altFt = sit.BaroPressureAltitude;
-      } else if (own.gpsValid) {
+      } else if (own.gpsValid && typeof sit.GPSAltitudeMSL === 'number' && Number.isFinite(sit.GPSAltitudeMSL)) {
         own.altFt = sit.GPSAltitudeMSL;
+      } else {
+        own.altFt = null;
       }
     }
   });

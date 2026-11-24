@@ -4,6 +4,7 @@ import {
   createEl,
   formatBytes,
   formatUptime,
+  isValidCpuTemp,
   setConnectionBadge,
   showToast,
   StratuxWS
@@ -13,9 +14,10 @@ function capabilityLabel(cap) {
   const c = Number(cap) || 0;
   const parts = [];
   if (c & 1) parts.push('GDL90');
-  if (c & 2) parts.push('AHRS');
-  if (c & 4) parts.push('FLARM/NMEA');
-  if (c & 8) parts.push('X-Plane');
+  if (c & 2) parts.push('X-Plane AHRS');
+  if (c & 4) parts.push('GDL90 AHRS');
+  if (c & 8) parts.push('FLARM/NMEA');
+  if (c & 16) parts.push('X-Plane Pos');
   return parts.length ? parts.join(', ') : `0x${c.toString(16)}`;
 }
 
@@ -122,7 +124,7 @@ export async function mount(container) {
       ['Debug Log Size', formatBytes(s.Logfile_Size)],
       ['AHRS Logs Size', formatBytes(s.AHRS_LogFiles_Size)],
       ['Connected Users', String(s.Connected_Users ?? 0)],
-      ['CPU Temp', typeof s.CPUTemp === 'number' ? `${s.CPUTemp.toFixed(1)}\u00B0C` : '--'],
+      ['CPU Temp', isValidCpuTemp(s.CPUTemp) ? `${s.CPUTemp.toFixed(1)}\u00B0C` : '--'],
       ['Trace Logging', 'Toggle Record Trace Logs in Settings; replay via stratuxrun -trace']
     ];
     for (const [k, v] of rows) {
@@ -161,8 +163,9 @@ export async function mount(container) {
         const iface = c.Interface || c.Iface || (addr.startsWith('192.168.10.') ? 'ap0/wlan0' : 'net');
         const proto = c.Protocol || capabilityLabel(c.Capability);
         const sleeping = Boolean(c.SleepFlag || c.Sleeping);
-        const stats = (c.MessagesSent !== undefined || c.BytesSent !== undefined)
-          ? `${c.MessagesSent ?? 0} msgs / ${formatBytes(c.BytesSent ?? 0)}`
+        const packetsSent = c.PacketsSent ?? c.MessagesSent;
+        const stats = (packetsSent !== undefined || c.BytesSent !== undefined)
+          ? `${packetsSent ?? 0} pkts / ${formatBytes(c.BytesSent ?? 0)}`
           : (c.LastPingResponse ? 'Active' : '--');
 
         tr.appendChild(createEl('td', { className: 'mono', text: addr }));

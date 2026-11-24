@@ -569,7 +569,7 @@ func makeStratuxStatus() []byte {
 		switch gpsFixQuality {
 		case 1: // 1 = 3D GPS.
 			msg[13] = 1
-		case 2: // 2 = DGPS (SBAS /WAAS).
+		case 2, 4, 5: // 2 = DGPS (SBAS/WAAS), 4 = RTK Fixed, 5 = RTK Float.
 			msg[13] = 2
 		default: // Zero.
 		}
@@ -1033,6 +1033,10 @@ func updateStatus() {
 		mySituation.GPSSatellitesSeen = 0
 		mySituation.GPSSatellitesTracked = 0
 		mySituation.GPSFixQuality = 0
+		mySituation.GPSHorizontalAccuracy = 999999
+		mySituation.GPSVerticalAccuracy = 999999
+		mySituation.GPSNACp = 0
+		mySituation.GPSPositionSampleRate = 0
 		posAccuracy = mySituation.GPSHorizontalAccuracy
 		mySituation.muGPS.Unlock()
 
@@ -1051,6 +1055,10 @@ func updateStatus() {
 			gpsSolution = "3D GPS + SBAS"
 		case 1:
 			gpsSolution = "3D GPS"
+		case 4:
+			gpsSolution = "RTK Fixed"
+		case 5:
+			gpsSolution = "RTK Float"
 		case 6:
 			gpsSolution = "Dead Reckoning"
 		case 0:

@@ -2,6 +2,7 @@ import {
   apiGet,
   createEl,
   formatDMS,
+  isValidSignalDb,
   setConnectionBadge
 } from '../app.js';
 
@@ -37,11 +38,14 @@ export async function mount(container) {
   const elBody = container.querySelector('#tw-tbody');
 
   function signalPct(db) {
-    // Typical RTL-SDR UAT dB readings range roughly -40 to 0 dB (or positive RSSI)
-    const val = Number(db);
-    if (!Number.isFinite(val)) return 0;
-    if (val <= 0) return Math.max(4, Math.min(100, Math.round(((val + 45) / 45) * 100)));
-    return Math.max(4, Math.min(100, Math.round(val)));
+    // Typical RTL-SDR UAT dB readings range roughly -45 to 0 dB (or positive RSSI)
+    if (!isValidSignalDb(db)) return 0;
+    if (db <= 0) return Math.max(4, Math.min(100, Math.round(((db + 45) / 45) * 100)));
+    return Math.max(4, Math.min(100, Math.round(db)));
+  }
+
+  function formatDb(val) {
+    return isValidSignalDb(val) ? val.toFixed(1) : '--';
   }
 
   async function poll() {
@@ -69,8 +73,8 @@ export async function mount(container) {
       for (const t of rows) {
         const tr = createEl('tr', {});
         tr.appendChild(createEl('td', { className: 'mono', text: `${formatDMS(t.Lat, true)}, ${formatDMS(t.Lng, true)}` }));
-        const nowSig = Number(t.Signal_strength_now ?? 0);
-        tr.appendChild(createEl('td', { className: 'mono', text: nowSig.toFixed(2) }));
+        const nowSig = t.Signal_strength_now;
+        tr.appendChild(createEl('td', { className: 'mono', text: formatDb(nowSig) }));
 
         const barTd = createEl('td', { style: { minWidth: '120px' } });
         const meter = createEl('div', { className: 'bar-meter' });
@@ -81,8 +85,8 @@ export async function mount(container) {
         barTd.appendChild(meter);
         tr.appendChild(barTd);
 
-        tr.appendChild(createEl('td', { className: 'mono', text: Number(t.Signal_strength_last_minute ?? 0).toFixed(2) }));
-        tr.appendChild(createEl('td', { className: 'mono', text: Number(t.Signal_strength_max ?? 0).toFixed(2) }));
+        tr.appendChild(createEl('td', { className: 'mono', text: formatDb(t.Signal_strength_last_minute) }));
+        tr.appendChild(createEl('td', { className: 'mono', text: formatDb(t.Signal_strength_max) }));
         tr.appendChild(createEl('td', { className: 'mono', text: String(t.Messages_last_minute ?? 0) }));
         tr.appendChild(createEl('td', { className: 'mono', text: String(t.Messages_total ?? 0) }));
         elBody.appendChild(tr);

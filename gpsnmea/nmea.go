@@ -96,46 +96,93 @@ func SanitizeTail(tail string) string {
 
 // ClassifySatellite maps a numeric NMEA satellite ID (SV) to its GNSS
 // constellation constant and constellation-local display ID, matching
-// Stratux's NMEA GSV/GSA classification rules in main/gps.go.
+// Stratux's NMEA 4.0 extended GSV/GSA classification rules.
 func ClassifySatellite(sv int) (constellation string, displayID int) {
+	switch {
+	case sv <= 0:
+		return ConstellationUnknown, sv
+	case sv <= 32:
+		return ConstellationGPS, sv // GPS 1-32
+	case sv <= 64:
+		return ConstellationSBAS, sv + 87 // SBAS 33-64 -> PRN 120-151
+	case sv <= 96:
+		return ConstellationGLONASS, sv - 64 // GLONASS 65-96 -> 1-32
+	case sv >= 152 && sv <= 158:
+		return ConstellationSBAS, sv // SBAS 152-158
+	case sv >= 193 && sv <= 202:
+		return ConstellationQZSS, sv - 192 // QZSS 193-202 -> 1-10
+	case sv >= 301 && sv <= 336:
+		return ConstellationGalileo, sv - 300 // Galileo 301-336 -> 1-36
+	case sv >= 401 && sv <= 463:
+		return ConstellationBeidou, sv - 400 // BeiDou 401-463 -> 1-63
+	default:
+		return ConstellationUnknown, sv
+	}
+}
+
+// ClassifySatelliteWithTalker maps a numeric NMEA satellite ID (SV) and
+// NMEA sentence/talker prefix (e.g. "GAGSV"/"GA", "GBGSV"/"BD", "GQGSV"/"GQ",
+// "GLGSV"/"GL", "GPGSV"/"GP") to its GNSS constellation and display ID.
+// It handles both NMEA 4.0 extended SV IDs (301-336 Galileo, 401-463 BeiDou)
+// and NMEA 4.10/4.11 talker-scoped local SV IDs (e.g. GAGSV 1-36, GBGSV 1-63).
+func ClassifySatelliteWithTalker(talker string, sv int) (constellation string, displayID int) {
 	if sv <= 0 {
 		return ConstellationUnknown, sv
-	} else if sv <= 32 {
-		return ConstellationGPS, sv // GPS 1-32
-	} else if sv <= 64 {
-		return ConstellationSBAS, sv + 87 // SBAS 33-64 -> PRN 120-151
-	} else if sv <= 96 {
-		return ConstellationGLONASS, sv - 64 // GLONASS 65-96 -> 1-32
-	} else if sv <= 158 {
-		return ConstellationSBAS, sv // SBAS 152-158
-	} else if sv <= 202 {
-		return ConstellationQZSS, sv - 192 // QZSS 193-202 -> 1-10
-	} else if sv <= 336 {
-		return ConstellationGalileo, sv - 300 // Galileo 301-336 -> 1-36
-	} else if sv <= 463 {
-		return ConstellationBeidou, sv - 400 // BeiDou 401-463 -> 1-63
 	}
-	return ConstellationUnknown, sv
+	prefix := strings.ToUpper(talker)
+	if len(prefix) > 2 {
+		prefix = prefix[:2]
+	}
+	switch prefix {
+	case "GA":
+		if sv >= 1 && sv <= 36 {
+			return ConstellationGalileo, sv
+		}
+	case "GB", "BD":
+		if sv >= 1 && sv <= 63 {
+			return ConstellationBeidou, sv
+		}
+	case "GQ":
+		if sv >= 1 && sv <= 10 {
+			return ConstellationQZSS, sv
+		}
+	case "GL":
+		if sv >= 1 && sv <= 32 {
+			return ConstellationGLONASS, sv
+		}
+	}
+	return ClassifySatellite(sv)
+}
+
+func formatSatellitePrefix(c string) string {
+	switch c {
+	case ConstellationGPS:
+		return "G"
+	case ConstellationSBAS:
+		return "S"
+	case ConstellationGLONASS:
+		return "R"
+	case ConstellationQZSS:
+		return "Q"
+	case ConstellationGalileo:
+		return "E"
+	case ConstellationBeidou:
+		return "B"
+	default:
+		return "U"
+	}
 }
 
 // FormatSatelliteID returns the short prefixed Stratux satellite label
 // (e.g. "G12", "S138", "R5", "Q1", "E12", "B5", "U0") for an NMEA SV ID.
 func FormatSatelliteID(sv int) string {
 	c, id := ClassifySatellite(sv)
-	prefix := "U"
-	switch c {
-	case ConstellationGPS:
-		prefix = "G"
-	case ConstellationSBAS:
-		prefix = "S"
-	case ConstellationGLONASS:
-		prefix = "R"
-	case ConstellationQZSS:
-		prefix = "Q"
-	case ConstellationGalileo:
-		prefix = "E"
-	case ConstellationBeidou:
-		prefix = "B"
-	}
-	return fmt.Sprintf("%s%d", prefix, id)
+	return fmt.Sprintf("%s%d", formatSatellitePrefix(c), id)
+}
+
+// FormatSatelliteIDWithTalker formats a satellite ID using both talker prefix
+// and NMEA SV ID (supporting both NMEA 4.0 extended and NMEA 4.10/4.11 local IDs).
+func FormatSatelliteIDWithTalker(talker string, sv int) string {
+	c, id := ClassifySatelliteWithTalker(talker, sv)
+	return fmt.Sprintf("%s%d", formatSatellitePrefix(c), id)
 }

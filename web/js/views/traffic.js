@@ -5,8 +5,11 @@ import {
   formatUTC,
   getCraftCategory,
   getTrafficSourceMeta,
+  isNonZeroTimestamp,
   isSameAircraft,
   isTrafficAged,
+  isValidSignalDb,
+  normalizeHeadingDeg,
   setConnectionBadge,
   StratuxWS,
   TARGET_TYPE_AIS
@@ -140,9 +143,24 @@ export async function mount(container) {
     const tail = (msg.Tail && msg.Tail.trim()) ? msg.Tail.trim() : hex;
     const reg = (msg.Reg && msg.Reg.trim()) ? msg.Reg.trim() : '';
     const alertLevel = Number(msg.AlertLevel) || 0;
-    const distNM = typeof msg.Distance === 'number' && msg.Distance > 0 ? msg.Distance / 1852 : Infinity;
-    const distEstNM = typeof msg.DistanceEstimated === 'number' && msg.DistanceEstimated > 0 ? msg.DistanceEstimated / 1852 : null;
+    const brgDistValid = Boolean(msg.BearingDist_valid);
+    const distNM = brgDistValid && typeof msg.Distance === 'number' && Number.isFinite(msg.Distance) && msg.Distance >= 0
+      ? msg.Distance / 1852
+      : Infinity;
+    const distEstNM = typeof msg.DistanceEstimated === 'number' && Number.isFinite(msg.DistanceEstimated) && msg.DistanceEstimated > 0
+      ? msg.DistanceEstimated / 1852
+      : null;
     const fused = Array.isArray(msg.FusedSources) ? msg.FusedSources : [];
+    const altValid = typeof msg.Alt === 'number' && Number.isFinite(msg.Alt) &&
+      (isNonZeroTimestamp(msg.Last_alt) || msg.Alt !== 0);
+    const altFt = altValid ? Math.round(msg.Alt / 25) * 25 : null;
+    const speedValid = Boolean(msg.Speed_valid) && typeof msg.Speed === 'number' && Number.isFinite(msg.Speed);
+    const speedKt = speedValid ? Math.max(0, Math.round(msg.Speed)) : null;
+    const trackDeg = speedValid ? normalizeHeadingDeg(msg.Track) : null;
+    const bearingDeg = brgDistValid ? normalizeHeadingDeg(msg.Bearing) : null;
+    const confidence = typeof msg.SourceConfidence === 'number' && Number.isFinite(msg.SourceConfidence) && msg.SourceConfidence > 0
+      ? Math.max(0, Math.min(100, Math.round(msg.SourceConfidence)))
+      : null;
 
     return {
       icao_int: msg.Icao_addr,
@@ -158,24 +176,24 @@ export async function mount(container) {
       Position_valid: Boolean(msg.Position_valid),
       Lat: msg.Lat,
       Lng: msg.Lng,
-      Alt: Math.round((Number(msg.Alt) || 0) / 25) * 25,
-      Vvel: Math.round((Number(msg.Vvel) || 0) / 100) * 100,
-      Speed: msg.Speed_valid ? Math.round((Number(msg.Speed) || 0) / 5) * 5 : null,
-      Track: msg.Speed_valid ? Math.round((Number(msg.Track) || 0) / 5) * 5 : null,
-      Bearing: typeof msg.Bearing === 'number' ? Math.round(msg.Bearing) : null,
+      Alt: altFt,
+      Vvel: typeof msg.Vvel === 'number' && Number.isFinite(msg.Vvel) ? Math.round(msg.Vvel / 100) * 100 : 0,
+      Speed: speedKt,
+      Track: trackDeg,
+      Bearing: bearingDeg,
       distNM,
       distEstNM,
-      SignalLevel: msg.SignalLevel,
-      Squawk: msg.Squawk ? String(msg.Squawk).padStart(4, '0') : '----',
-      Age: Number(msg.Age) || 0,
-      AgeLastAlt: Number(msg.AgeLastAlt) || 0,
+      SignalLevel: isValidSignalDb(msg.SignalLevel) ? msg.SignalLevel : null,
+      Squawk: (typeof msg.Squawk === 'number' && msg.Squawk > 0) ? String(msg.Squawk).padStart(4, '0') : '----',
+      Age: Number.isFinite(Number(msg.Age)) ? Math.max(0, Number(msg.Age)) : 0,
+      AgeLastAlt: Number.isFinite(Number(msg.AgeLastAlt)) ? Math.max(0, Number(msg.AgeLastAlt)) : 0,
       Timestamp: msg.Timestamp,
       AlertLevel: alertLevel,
-      TimeToCPA: typeof msg.TimeToCPA === 'number' ? msg.TimeToCPA : null,
-      HorizMissDist: typeof msg.HorizMissDist === 'number' ? msg.HorizMissDist : null,
-      VertMissDist: typeof msg.VertMissDist === 'number' ? msg.VertMissDist : null,
+      TimeToCPA: typeof msg.TimeToCPA === 'number' && Number.isFinite(msg.TimeToCPA) && msg.TimeToCPA >= 0 && msg.TimeToCPA < 3600 ? msg.TimeToCPA : null,
+      HorizMissDist: typeof msg.HorizMissDist === 'number' && Number.isFinite(msg.HorizMissDist) ? msg.HorizMissDist : null,
+      VertMissDist: typeof msg.VertMissDist === 'number' && Number.isFinite(msg.VertMissDist) ? msg.VertMissDist : null,
       Callout: msg.Callout ? String(msg.Callout) : '',
-      SourceConfidence: typeof msg.SourceConfidence === 'number' ? msg.SourceConfidence : null,
+      SourceConfidence: confidence,
       FusedSources: fused
     };
   }
@@ -234,7 +252,7 @@ export async function mount(container) {
         diff = a.tail.localeCompare(b.tail);
         break;
       case 'alt':
-        diff = a.Alt - b.Alt;
+        diff = (a.Alt ?? -999999) - (b.Alt ?? -999999);
         break;
       case 'dist':
         diff = a.distNM - b.distNM;
@@ -281,7 +299,7 @@ export async function mount(container) {
       wrap.appendChild(createEl('span', {
         className: 'muted mono',
         style: { fontSize: '0.75rem' },
-        text: `${Math.round(t.SourceConfidence * 100)}%`
+        text: `${t.SourceConfidence}%`
       }));
     }
     return wrap;
@@ -331,12 +349,12 @@ export async function mount(container) {
         tr.appendChild(createEl('td', {}, sourceBadges(t)));
 
         const vArrow = t.Vvel > 150 ? ' \u2191' : t.Vvel < -150 ? ' \u2193' : '';
-        tr.appendChild(createEl('td', { className: 'mono', text: `${t.Alt.toLocaleString()}${vArrow}` }));
+        tr.appendChild(createEl('td', { className: 'mono', text: t.Alt !== null ? `${t.Alt.toLocaleString()}${vArrow}` : '--' }));
         tr.appendChild(createEl('td', { className: 'mono', text: Number.isFinite(t.distNM) ? t.distNM.toFixed(1) : '--' }));
-        tr.appendChild(createEl('td', { className: 'mono', text: t.Bearing !== null ? `${t.Bearing}\u00B0` : '--' }));
+        tr.appendChild(createEl('td', { className: 'mono', text: t.Bearing !== null ? `${String(t.Bearing).padStart(3, '0')}\u00B0` : '--' }));
         tr.appendChild(createEl('td', {
           className: 'mono',
-          text: t.Speed !== null ? `${t.Speed}kt / ${String(t.Track).padStart(3, '0')}\u00B0` : '---'
+          text: t.Speed !== null && t.Track !== null ? `${t.Speed}kt / ${String(t.Track).padStart(3, '0')}\u00B0` : '---'
         }));
         tr.appendChild(createEl('td', { className: 'mono', text: `${formatDMS(t.Lat)} ${formatDMS(t.Lng)}` }));
         tr.appendChild(createEl('td', { className: 'mono', text: `${t.Squawk} / ${t.category}` }));
@@ -353,9 +371,9 @@ export async function mount(container) {
         const tr = createEl('tr', {});
         tr.appendChild(createEl('td', { className: 'mono', text: `${t.tail} (${t.hex})` }));
         tr.appendChild(createEl('td', {}, sourceBadges(t)));
-        tr.appendChild(createEl('td', { className: 'mono', text: t.Alt ? t.Alt.toLocaleString() : '--' }));
+        tr.appendChild(createEl('td', { className: 'mono', text: t.Alt !== null ? t.Alt.toLocaleString() : '--' }));
         tr.appendChild(createEl('td', { className: 'mono', text: t.distEstNM !== null ? `~${t.distEstNM.toFixed(1)}` : '--' }));
-        tr.appendChild(createEl('td', { className: 'mono', text: typeof t.SignalLevel === 'number' ? `${t.SignalLevel.toFixed(1)} dB` : '--' }));
+        tr.appendChild(createEl('td', { className: 'mono', text: t.SignalLevel !== null ? `${t.SignalLevel.toFixed(1)} dB` : '--' }));
         tr.appendChild(createEl('td', { className: 'mono', text: t.Squawk }));
         tr.appendChild(createEl('td', { className: 'mono', text: `${Math.round(t.Age)}s` }));
         elOtherBody.appendChild(tr);

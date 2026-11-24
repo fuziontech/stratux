@@ -3,7 +3,10 @@ import {
   createEl,
   escapeHtml,
   getCraftHexColor,
+  isNonZeroTimestamp,
   isTrafficAged,
+  isValidGpsAccuracy,
+  normalizeHeadingDeg,
   setConnectionBadge,
   StratuxWS,
   TARGET_TYPE_AIS,
@@ -263,10 +266,12 @@ export async function mount(container) {
         shown = true;
       } else if (ac) {
         const hex = (ac.Icao_addr >>> 0).toString(16).toUpperCase().padStart(6, '0');
+        const altValid = typeof ac.Alt === 'number' && Number.isFinite(ac.Alt) && (isNonZeroTimestamp(ac.Last_alt) || ac.Alt !== 0);
+        const hdg = ac.Speed_valid ? normalizeHeadingDeg(ac.Track) : null;
         showPopup(
           `${ac.Tail || hex}`,
           [
-            `Alt: ${Math.round(ac.Alt || 0)} ft | Spd: ${ac.Speed_valid ? Math.round(ac.Speed) + ' kt' : '--'} | Hdg: ${ac.Speed_valid ? Math.round(ac.Track) + '\u00B0' : '--'}`,
+            `Alt: ${altValid ? Math.round(ac.Alt) + ' ft' : '--'} | Spd: ${ac.Speed_valid && Number.isFinite(ac.Speed) ? Math.round(ac.Speed) + ' kt' : '--'} | Hdg: ${hdg !== null ? String(hdg).padStart(3, '0') + '\u00B0' : '--'}`,
             ac.Callout ? `CPA: ${ac.Callout}` : ''
           ].filter(Boolean)
         );
@@ -368,7 +373,8 @@ export async function mount(container) {
     entry.marker.set('acItem', ac);
     const labelParts = [];
     if (ac.Tail && ac.Tail.trim()) labelParts.push(ac.Tail.trim());
-    if (ac.TargetType !== TARGET_TYPE_AIS) labelParts.push(`${Math.round(ac.Alt || 0)}ft`);
+    const hasAlt = typeof ac.Alt === 'number' && Number.isFinite(ac.Alt) && (isNonZeroTimestamp(ac.Last_alt) || ac.Alt !== 0);
+    if (ac.TargetType !== TARGET_TYPE_AIS && hasAlt) labelParts.push(`${Math.round(ac.Alt)}ft`);
     entry.marker.getStyle().getText().setText(labelParts.join('\n'));
     const img = entry.marker.getStyle().getImage();
     if (img) {
@@ -380,7 +386,7 @@ export async function mount(container) {
   }
 
   function updateOwnship(sit) {
-    if (!sit || sit.GPSFixQuality <= 0 || (sit.GPSLatitude === 0 && sit.GPSLongitude === 0)) return;
+    if (!sit || (sit.GPSFixQuality || 0) <= 0 || !isValidGpsAccuracy(sit.GPSHorizontalAccuracy) || (sit.GPSLatitude === 0 && sit.GPSLongitude === 0)) return;
     ownPosLonLat = [sit.GPSLongitude, sit.GPSLatitude];
     const proj = ol.proj.fromLonLat(ownPosLonLat);
     if (!ownFeature) {

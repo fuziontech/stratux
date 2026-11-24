@@ -115,7 +115,48 @@ export function formatUTC(ts) {
 }
 
 export function isNonZeroTimestamp(ts) {
-  return Boolean(ts && ts !== '0001-01-01T00:00:00Z');
+  if (!ts) return false;
+  const s = String(ts);
+  if (s.startsWith('0001-01-01')) return false;
+  return Number.isFinite(Date.parse(s));
+}
+
+export const AHRS_INVALID_VALUE = 3276.7;
+
+export function isValidAhrsAngle(val, maxAbs = 360) {
+  return (
+    typeof val === 'number' &&
+    Number.isFinite(val) &&
+    Math.abs(val - AHRS_INVALID_VALUE) > 0.1 &&
+    Math.abs(val) <= maxAbs
+  );
+}
+
+export function isValidAhrsGLoad(val) {
+  return (
+    typeof val === 'number' &&
+    Number.isFinite(val) &&
+    Math.abs(val - AHRS_INVALID_VALUE) > 0.1 &&
+    Math.abs(val) <= 30
+  );
+}
+
+export function isValidCpuTemp(val) {
+  return typeof val === 'number' && Number.isFinite(val) && val > -90 && val < 150;
+}
+
+export function isValidSignalDb(val) {
+  return typeof val === 'number' && Number.isFinite(val) && val > -100 && val <= 100;
+}
+
+export function isValidGpsAccuracy(val) {
+  return typeof val === 'number' && Number.isFinite(val) && val > 0 && val < 19999;
+}
+
+export function normalizeHeadingDeg(val) {
+  if (typeof val !== 'number' || !Number.isFinite(val)) return null;
+  const rounded = Math.round(val);
+  return ((rounded % 360) + 360) % 360;
 }
 
 export function isSameAircraft(addr1, addrType1, addr2, addrType2) {

@@ -27,7 +27,7 @@ const WIFI_COUNTRIES = [
 
 function isValidSSID(str) { return /^[a-zA-Z0-9()! \._'-]{1,32}$/.test(str); }
 function isValidWPA(str) { return /^[\u0020-\u007e]{8,63}$/.test(str); }
-function isValidPin(str) { return /^(\d{4}|\d{8})$/.test(str); }
+function isValidPin(str) { return /^\d{8}$/.test(str); }
 function isValidIPv4(str) { return /^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$/.test(str); }
 function isValidHexList(str) { return /^$|^([0-9A-Fa-f]{6})(,[0-9A-Fa-f]{6})*$/.test(str.trim()); }
 
@@ -365,7 +365,7 @@ export async function mount(container) {
       formWrap.appendChild(fieldRow('Wi-Fi Passphrase', passInp));
 
       if (state.WiFiMode === '1') {
-        const pinInp = createEl('input', { type: 'text', className: 'input', value: state.WiFiDirectPin, placeholder: '4 or 8 digits' });
+        const pinInp = createEl('input', { type: 'text', className: 'input', value: state.WiFiDirectPin, placeholder: '8 digits' });
         pinInp.addEventListener('input', () => { state.WiFiDirectPin = pinInp.value; });
         formWrap.appendChild(fieldRow('Wi-Fi Direct PIN', pinInp));
       }
@@ -437,7 +437,7 @@ export async function mount(container) {
             return;
           }
           if (state.WiFiMode === '1' && !isValidPin(state.WiFiDirectPin)) {
-            showToast('Wi-Fi Direct PIN must be 4 or 8 digits', 'error');
+            showToast('Wi-Fi Direct PIN must be 8 digits', 'error');
             return;
           }
           if (state.WiFiIPAddress && !isValidIPv4(state.WiFiIPAddress.trim())) {
@@ -527,8 +527,16 @@ export async function mount(container) {
             statusLbl.textContent = 'Flashing firmware... please wait...';
             try {
               const res = await apiPost('/flashFirmware', { Target: target, Firmware: firmware });
-              statusLbl.textContent = typeof res === 'string' ? res : 'Firmware flashed successfully!';
-              showToast('Firmware flash completed', 'ok');
+              if (res && typeof res === 'object' && res.Success === false) {
+                const errMsg = res.Error || res.Output || 'Firmware flash failed';
+                statusLbl.textContent = `Flash error: ${errMsg}`;
+                showToast(`Flash failed: ${errMsg}`, 'error');
+              } else {
+                statusLbl.textContent = typeof res === 'string'
+                  ? res
+                  : (res?.Output || 'Firmware flashed successfully!');
+                showToast('Firmware flash completed', 'ok');
+              }
             } catch (err) {
               statusLbl.textContent = `Flash error: ${err.message}`;
               showToast(`Flash failed: ${err.message}`, 'error');
@@ -574,17 +582,15 @@ export async function mount(container) {
     elOutputs.appendChild(switchRow('Persistent Logging (SD Card)', 'Write logs to SD instead of RAM (reboot required)', 'PersistentLogging'));
     elOutputs.appendChild(switchRow('Developer Mode', 'Expose Developer tab and diagnostics', 'DeveloperMode'));
 
-    if (settings.IMU_Sensor_Enabled) {
-      elOutputs.appendChild(inputRow(
-        'Minimum Cooling Fan Duty (%)',
-        'PWM fan minimum speed (0-100)',
-        settings.PWMDutyMin ?? 0,
-        {
-          type: 'number',
-          onSave: (v) => savePatch({ PWMDutyMin: Math.max(0, Math.min(100, parseInt(v, 10) || 0)) })
-        }
-      ));
-    }
+    elOutputs.appendChild(inputRow(
+      'Minimum Cooling Fan Duty (%)',
+      'PWM fan minimum speed (0-100)',
+      settings.PWMDutyMin ?? 0,
+      {
+        type: 'number',
+        onSave: (v) => savePatch({ PWMDutyMin: Math.max(0, Math.min(100, parseInt(v, 10) || 0)) })
+      }
+    ));
   }
 
   function renderSystem() {

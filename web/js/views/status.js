@@ -5,8 +5,12 @@ import {
   buildSparklineSVG,
   createEl,
   escapeHtml,
+  formatBytes,
   formatUptime,
   getGpsHardwareLabel,
+  isValidCpuTemp,
+  isValidGpsAccuracy,
+  isValidSignalDb,
   setConnectionBadge,
   showToast,
   StratuxWS
@@ -183,21 +187,23 @@ export async function mount(container) {
     elPowerMetrics.textContent = '';
     elPowerKv.textContent = '';
 
-    const tempC = lastHealth?.CPUTempC ?? lastStatus?.CPUTemp;
-    const tempStr = typeof tempC === 'number' && Number.isFinite(tempC)
-      ? `${tempC.toFixed(1)}\u00B0C`
-      : '--';
-    const tempF = typeof tempC === 'number' && Number.isFinite(tempC)
-      ? `${((tempC * 9) / 5 + 32).toFixed(1)}\u00B0F`
-      : '';
+    const rawTempC = isValidCpuTemp(lastHealth?.CPUTempC) ? lastHealth.CPUTempC : lastStatus?.CPUTemp;
+    const tempValid = isValidCpuTemp(rawTempC);
+    const tempStr = tempValid ? `${rawTempC.toFixed(1)}\u00B0C` : '--';
+    const tempF = tempValid ? `${((rawTempC * 9) / 5 + 32).toFixed(1)}\u00B0F` : '';
 
     elPowerMetrics.appendChild(metricBox('CPU Temp', tempStr, tempF));
 
     const pwr = lastHealth?.Power;
     if (pwr && pwr.Available) {
-      const pct = typeof pwr.BatteryPct === 'number' ? `${Math.round(pwr.BatteryPct)}%` : '--';
-      const volts = typeof pwr.VoltageV === 'number' ? `${pwr.VoltageV.toFixed(2)} V` : '';
-      elPowerMetrics.appendChild(metricBox('Power / Battery', pct, `${volts}${pwr.Source ? ` (${pwr.Source})` : ''}`));
+      const hasBattPct = typeof pwr.BatteryPct === 'number' && Number.isFinite(pwr.BatteryPct) && pwr.BatteryPct > 0 && pwr.BatteryPct <= 100;
+      const volts = typeof pwr.VoltageV === 'number' && Number.isFinite(pwr.VoltageV) && pwr.VoltageV > 0 ? `${pwr.VoltageV.toFixed(2)} V` : '';
+      const amps = typeof pwr.CurrentMa === 'number' && Number.isFinite(pwr.CurrentMa) && pwr.CurrentMa !== 0 ? `${Math.round(pwr.CurrentMa)} mA` : '';
+      if (hasBattPct) {
+        elPowerMetrics.appendChild(metricBox('Power / Battery', `${Math.round(pwr.BatteryPct)}%`, `${volts}${pwr.Source ? ` (${pwr.Source})` : ''}`.trim()));
+      } else {
+        elPowerMetrics.appendChild(metricBox('Power Rail', volts || '--', `${amps}${pwr.Source ? ` (${pwr.Source})` : ''}`.trim()));
+      }
       elPowerBadge.textContent = pwr.Source || 'Monitored';
       elPowerBadge.className = 'badge badge-ok';
     } else {
@@ -216,8 +222,8 @@ export async function mount(container) {
       elPowerKv.appendChild(kvRow('Pi Throttle Flags', lastHealth ? 'Unavailable on host' : 'Waiting for /getHealth'));
     }
 
-    if (lastStatus && typeof lastStatus.DiskBytesFree === 'number') {
-      elPowerKv.appendChild(kvRow('Disk Free', `${(lastStatus.DiskBytesFree / 1048576).toFixed(1)} MiB`));
+    if (lastStatus && typeof lastStatus.DiskBytesFree === 'number' && Number.isFinite(lastStatus.DiskBytesFree)) {
+      elPowerKv.appendChild(kvRow('Disk Free', formatBytes(lastStatus.DiskBytesFree)));
     }
   }
 
@@ -246,7 +252,7 @@ export async function mount(container) {
     elSysMetrics.appendChild(metricBox('Uptime', formatUptime(s.Uptime)));
     elSysMetrics.appendChild(metricBox('EFB Clients', String(s.Connected_Users ?? 0)));
     elSysKv.textContent = '';
-    if (typeof s.CPUTempMin === 'number' && typeof s.CPUTempMax === 'number') {
+    if (isValidCpuTemp(s.CPUTempMin) && isValidCpuTemp(s.CPUTempMax)) {
       elSysKv.appendChild(kvRow('CPU Min / Max', `${s.CPUTempMin.toFixed(1)}\u00B0C / ${s.CPUTempMax.toFixed(1)}\u00B0C`));
     }
     elSysKv.appendChild(kvRow('SDR Devices', String(s.Devices ?? 0)));
@@ -256,10 +262,10 @@ export async function mount(container) {
     // GPS card
     const sol = s.GPS_solution || 'Unknown';
     elGpsBadge.textContent = sol;
-    elGpsBadge.className = (sol === '3D GPS' || sol === '3D GPS + SBAS') ? 'badge badge-ok' : 'badge badge-warn';
+    elGpsBadge.className = (sol === '3D GPS' || sol === '3D GPS + SBAS' || sol === 'RTK Fixed' || sol === 'RTK Float') ? 'badge badge-ok' : 'badge badge-warn';
     elGpsKv.textContent = '';
     elGpsKv.appendChild(kvRow('Hardware', getGpsHardwareLabel(s.GPS_detected_type)));
-    const acc = (sol !== 'Disconnected' && sol !== 'No Fix' && sol !== 'Unknown' && typeof s.GPS_position_accuracy === 'number')
+    const acc = (sol !== 'Disconnected' && sol !== 'No Fix' && sol !== 'Unknown' && isValidGpsAccuracy(s.GPS_position_accuracy))
       ? `${s.GPS_position_accuracy.toFixed(1)} m`
       : '--';
     elGpsKv.appendChild(kvRow('Position Accuracy', acc));
@@ -313,7 +319,9 @@ export async function mount(container) {
         lastMin: s.OGN_messages_last_minute ?? 0,
         maxMin: s.OGN_messages_max ?? 0,
         total: s.OGN_messages_total ?? 0,
-        extra: s.OGN_connected ? `Noise ${Number(s.OGN_noise_db || 0).toFixed(1)} dB | Gain ${Number(s.OGN_gain_db || 0).toFixed(1)} dB` : 'Disconnected',
+        extra: s.OGN_connected
+          ? `Noise ${isValidSignalDb(s.OGN_noise_db) ? s.OGN_noise_db.toFixed(1) : '--'} dB | Gain ${isValidSignalDb(s.OGN_gain_db) ? s.OGN_gain_db.toFixed(1) : '--'} dB`
+          : 'Disconnected',
         health: lastHealth?.OGN
       },
       {
@@ -335,14 +343,15 @@ export async function mount(container) {
       if (b.health?.OverloadAlert) {
         badges.appendChild(createEl('span', { className: 'badge badge-danger', text: 'OVERLOAD' }));
       }
-      if (typeof b.health?.ClippedPercent === 'number' && b.health.ClippedPercent > 0) {
+      if (typeof b.health?.ClippedPercent === 'number' && Number.isFinite(b.health.ClippedPercent) && b.health.ClippedPercent > 0) {
+        const clipPct = Math.max(0, Math.min(100, b.health.ClippedPercent));
         badges.appendChild(createEl('span', {
-          className: `badge ${b.health.ClippedPercent > 5 ? 'badge-warn' : ''}`,
-          text: `IQ Clip ${b.health.ClippedPercent.toFixed(1)}%`
+          className: `badge ${clipPct > 5 ? 'badge-warn' : ''}`,
+          text: `IQ Clip ${clipPct.toFixed(1)}%`
         }));
       }
-      const rateStr = typeof b.health?.MsgsPerSec === 'number'
-        ? `${b.health.MsgsPerSec.toFixed(1)}/s`
+      const rateStr = typeof b.health?.MsgsPerSec === 'number' && Number.isFinite(b.health.MsgsPerSec)
+        ? `${Math.round(b.health.MsgsPerSec)}/s`
         : `${b.lastMin}/min`;
       badges.appendChild(createEl('span', { className: 'badge mono', text: rateStr }));
       head.appendChild(badges);

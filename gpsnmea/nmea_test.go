@@ -139,6 +139,10 @@ func TestClassifySatellite(t *testing.T) {
 		{336, ConstellationGalileo, 36, "E36"},
 		{401, ConstellationBeidou, 1, "B1"},
 		{463, ConstellationBeidou, 63, "B63"},
+		{100, ConstellationUnknown, 100, "U100"},
+		{180, ConstellationUnknown, 180, "U180"},
+		{250, ConstellationUnknown, 250, "U250"},
+		{350, ConstellationUnknown, 350, "U350"},
 		{464, ConstellationUnknown, 464, "U464"},
 		{999, ConstellationUnknown, 999, "U999"},
 	}
@@ -151,6 +155,34 @@ func TestClassifySatellite(t *testing.T) {
 		}
 		if gotLabel := FormatSatelliteID(tc.sv); gotLabel != tc.wantLabel {
 			t.Errorf("FormatSatelliteID(%d) = %q, want %q", tc.sv, gotLabel, tc.wantLabel)
+		}
+	}
+}
+
+func TestClassifySatelliteWithTalker(t *testing.T) {
+	cases := []struct {
+		talker    string
+		sv        int
+		wantConst string
+		wantLabel string
+	}{
+		{"GAGSV", 12, ConstellationGalileo, "E12"},
+		{"GAGSV", 312, ConstellationGalileo, "E12"},
+		{"GBGSV", 19, ConstellationBeidou, "B19"},
+		{"BDGSV", 5, ConstellationBeidou, "B5"},
+		{"GBGSV", 419, ConstellationBeidou, "B19"},
+		{"GQGSV", 2, ConstellationQZSS, "Q2"},
+		{"GLGSV", 7, ConstellationGLONASS, "R7"},
+		{"GLGSV", 71, ConstellationGLONASS, "R7"},
+		{"GPGSV", 12, ConstellationGPS, "G12"},
+		{"GPGSV", 51, ConstellationSBAS, "S138"},
+	}
+	for _, tc := range cases {
+		gotConst, _ := ClassifySatelliteWithTalker(tc.talker, tc.sv)
+		gotLabel := FormatSatelliteIDWithTalker(tc.talker, tc.sv)
+		if gotConst != tc.wantConst || gotLabel != tc.wantLabel {
+			t.Errorf("ClassifySatelliteWithTalker(%q, %d) = (%q, %q), want (%q, %q)",
+				tc.talker, tc.sv, gotConst, gotLabel, tc.wantConst, tc.wantLabel)
 		}
 	}
 }
