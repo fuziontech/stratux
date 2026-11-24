@@ -23,18 +23,22 @@ case "${1:-}" in
 			systemctl daemon-reload || true
 
 			echo "Reloading udev rules"
-			systemctl restart udev 2>/dev/null || udevadm control --reload-rules 2>/dev/null || true
+			systemctl restart --no-block udev 2>/dev/null || udevadm control --reload-rules 2>/dev/null || true
 
-			echo "Starting stratux USB gadget and main service"
-			systemctl start stratux-usb-gadget.service 2>/dev/null || true
-			systemctl start stratux.service || true
+			if [ "${STRATUX_OTA_INSTALL:-0}" = "1" ]; then
+				echo "Boot-time OTA install in progress; skipping service start before reboot"
+			else
+				echo "Starting stratux USB gadget and main service"
+				systemctl start --no-block stratux-usb-gadget.service 2>/dev/null || true
+				systemctl start --no-block stratux.service || true
 
-			if [ "${is_rpi}" = "true" ]; then
-				systemctl start stratux_fancontrol.service || true
+				if [ "${is_rpi}" = "true" ]; then
+					systemctl start --no-block stratux_fancontrol.service || true
+				fi
 			fi
 
 			if systemctl is-active --quiet avahi-daemon.service 2>/dev/null; then
-				systemctl reload avahi-daemon.service 2>/dev/null || true
+				systemctl reload --no-block avahi-daemon.service 2>/dev/null || true
 			fi
 		fi
 		;;

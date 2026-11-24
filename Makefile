@@ -151,8 +151,8 @@ dpkg: optinstall_dpkg
 	# Create the default US settings for the config default
 	echo '{"UAT_Enabled": true,"OGN_Enabled": false,"DeveloperMode": false}' > $(DEBPKG_HOME)/cfg/stratux.conf.default
 	chmod 0644 $(DEBPKG_HOME)/cfg/stratux.conf.default
-	# Create the debian package
-	dpkg-deb -b $(DEBPKG_BASE)
+	# Create the debian package with clean root:root ownership
+	dpkg-deb --root-owner-group -b $(DEBPKG_BASE)
 	# Rename the file and move it to the base directory. Include the arch in the name
 	mv -f $(DEBPKG_BASE)/../stratux.deb ./stratux-$(VERSIONSTR)-$(ARCH).deb
 

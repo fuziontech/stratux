@@ -349,7 +349,7 @@ if (( ${#update_package_files[@]} > 0 )); then
 			printf 'package=%s\ntimestamp=%s\n' "${base_name}" "$(date -u +%FT%TZ)" > "${OTA_PENDING_FILE}"
 			# Re-enable overlay for next boot before calling dpkg.
 			rm -f /overlay/disable
-			if dpkg -i --force-depends "${UPDATE_TEMP_FILE}" >> "${STX_LOG}" 2>&1; then
+			if STRATUX_OTA_INSTALL=1 DEBIAN_FRONTEND=noninteractive dpkg -i --force-depends --force-confnew "${UPDATE_TEMP_FILE}" >> "${STX_LOG}" 2>&1; then
 				wLog "Package installed successfully. Post-boot OTA watchdog armed."
 				rm -f -- "${UPDATE_TEMP_FILE}"
 				do_reboot "Finished package installation. Rebooting..."

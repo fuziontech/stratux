@@ -4,7 +4,9 @@ set -e
 case "${1:-}" in
 	remove|upgrade|deconfigure)
 		echo "Running pre-removal script for the stratux service"
-		if [ -d /run/systemd/system ]; then
+		if [ "${STRATUX_OTA_INSTALL:-0}" = "1" ]; then
+			echo "Boot-time OTA install in progress; skipping service stop"
+		elif [ -d /run/systemd/system ]; then
 			arch="$(uname -m)"
 			if [ "${arch}" = "aarch64" ] && [ -f "/boot/firmware/config.txt" ]; then
 				systemctl stop stratux_fancontrol.service 2>/dev/null || true

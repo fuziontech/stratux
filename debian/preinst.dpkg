@@ -4,7 +4,9 @@ set -e
 case "${1:-}" in
 	install|upgrade)
 		echo "Running pre-installation script and stopping the stratux service"
-		if [ -d /run/systemd/system ]; then
+		if [ "${STRATUX_OTA_INSTALL:-0}" = "1" ]; then
+			echo "Boot-time OTA install in progress; stratux services have not started yet"
+		elif [ -d /run/systemd/system ]; then
 			# Raspberry Pi's have config.txt so this is one way to determine if it is a Raspberry Pi
 			arch="$(uname -m)"
 			if [ "${arch}" = "aarch64" ] && [ -f "/boot/firmware/config.txt" ]; then

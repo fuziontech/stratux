@@ -9,15 +9,5 @@ RestartSec=5
 LimitCORE=0
 StandardOutput=null
 
-# Baseline hardening compatible with GPIO PWM and thermal sysfs reads
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-
 [Install]
 WantedBy=multi-user.target

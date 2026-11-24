@@ -10,11 +10,5 @@ RestartSec=5
 LimitCORE=0
 StandardOutput=null
 
-# Baseline hardening compatible with Stratux network/hardware/overlay management
-ProtectHome=read-only
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-
 [Install]
 WantedBy=multi-user.target
